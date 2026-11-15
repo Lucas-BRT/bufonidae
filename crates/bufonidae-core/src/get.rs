@@ -225,8 +225,8 @@ mod tests {
             &self,
             _: &Account,
             _: &str,
-        ) -> Result<HashMap<String, u64>, RemoteError> {
-            Ok(HashMap::new())
+        ) -> Result<crate::put::Listing, RemoteError> {
+            Ok(crate::put::Listing::default())
         }
         async fn upload(&self, _: &Account, _: &Path, _: &str, _: &str) -> Result<(), RemoteError> {
             Err(RemoteError::Remote("not used by get".into()))

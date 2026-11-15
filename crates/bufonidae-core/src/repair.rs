@@ -237,8 +237,8 @@ mod tests {
             &self,
             _: &Account,
             _: &str,
-        ) -> Result<HashMap<String, u64>, RemoteError> {
-            Ok(HashMap::new())
+        ) -> Result<crate::put::Listing, RemoteError> {
+            Ok(crate::put::Listing::default())
         }
         async fn download(
             &self,

@@ -411,6 +411,12 @@ fn print_reconcile(r: &reconcile::Report) {
     for (p, a, want, got) in &r.conflicts {
         eprintln!("CONFLICT   {p} ({a}): other copies are {want} bytes, this one is {got}");
     }
+    for (p, a) in &r.duplicates {
+        eprintln!(
+            "DUPLICATE  {p} ({a}): the name exists twice there, so it was left alone; \
+             remove one of them on mega.nz"
+        );
+    }
     for (a, e) in &r.unreachable {
         eprintln!("UNREACHABLE {a}: {e}; its entries were not touched");
     }

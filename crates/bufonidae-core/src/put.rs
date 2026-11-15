@@ -1,7 +1,7 @@
 //! `put`: copy local files and folders into a pool of accounts, one file at a
 //! time, each file on the account the placement policy picks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -31,6 +31,41 @@ pub enum Error {
     DuplicateAccount(String),
 }
 
+/// The files under a folder of one account.
+///
+/// Mega allows two files with the same name in one folder. A map cannot hold
+/// both, so a name seen twice goes in `duplicates` and is treated as
+/// ambiguous by everything that could change or delete data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// Path (relative to the listed folder) to size in bytes.
+    pub files: HashMap<String, u64>,
+    /// Paths that appeared more than once.
+    pub duplicates: BTreeSet<String>,
+}
+
+impl Listing {
+    /// Builds a listing, moving repeated paths to `duplicates`.
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, u64)>) -> Self {
+        let mut listing = Self::default();
+        for (path, size) in entries {
+            if listing.files.insert(path.clone(), size).is_some() {
+                listing.duplicates.insert(path);
+            }
+        }
+        // An ambiguous name has no single size to trust.
+        for path in &listing.duplicates {
+            listing.files.remove(path);
+        }
+        listing
+    }
+
+    /// Every path present, ambiguous or not.
+    pub fn paths(&self) -> impl Iterator<Item = &String> {
+        self.files.keys().chain(self.duplicates.iter())
+    }
+}
+
 /// What `put` needs from a storage account. Implemented over `rclone rcd` for
 /// real use and by a deterministic fake in tests.
 pub trait RemoteFs {
@@ -43,7 +78,7 @@ pub trait RemoteFs {
         &self,
         account: &Account,
         dir: &str,
-    ) -> impl Future<Output = Result<HashMap<String, u64>, Error>>;
+    ) -> impl Future<Output = Result<Listing, Error>>;
     /// Copies `remote_path` from the account to `dest_dir/dest_rel` on the
     /// local disk.
     fn download(
@@ -72,23 +107,27 @@ impl RemoteFs for Rcd {
         Ok(about.free)
     }
 
-    async fn list_files(
-        &self,
-        account: &Account,
-        dir: &str,
-    ) -> Result<HashMap<String, u64>, Error> {
+    async fn list_files(&self, account: &Account, dir: &str) -> Result<Listing, Error> {
         match self
             .list_files_recursive(&format!("{}:", account.remote_name()), dir)
             .await
         {
-            Ok(entries) => Ok(entries
-                .into_iter()
-                .map(|e| (e.path, u64::try_from(e.size).unwrap_or(0)))
-                .collect()),
+            Ok(entries) => {
+                let mut sized = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    // A negative size means rclone does not know it; reading
+                    // that as 0 would make a real file look empty.
+                    let size = u64::try_from(entry.size).map_err(|_| {
+                        Error::Remote(format!("rclone reported no size for {}", entry.path))
+                    })?;
+                    sized.push((entry.path, size));
+                }
+                Ok(Listing::from_entries(sized))
+            }
             // The folder does not exist yet on this account. Only rclone's own
             // "directory not found" answer counts: any other failure must stay
             // an error, or a reconcile would read it as "everything is gone".
-            Err(e) if e.is_directory_not_found() => Ok(HashMap::new()),
+            Err(e) if e.is_directory_not_found() => Ok(Listing::default()),
             Err(e) => Err(Error::Remote(e.to_string())),
         }
     }
@@ -336,7 +375,9 @@ pub async fn put_observed<R: RemoteFs>(
     let mut present = HashSet::new();
     let mut spaces = Vec::new();
     for (i, account) in accounts.iter().enumerate() {
-        present.extend(remote.list_files(account, &dest).await?.into_keys());
+        // An ambiguous (duplicated) name counts as present: it must not be
+        // uploaded over.
+        present.extend(remote.list_files(account, &dest).await?.paths().cloned());
         let free = remote.free_space(account).await?.ok_or_else(|| {
             Error::Remote(format!(
                 "account {:?} does not report its free space",
@@ -447,14 +488,14 @@ mod tests {
         async fn free_space(&self, a: &Account) -> Result<Option<u64>, Error> {
             Ok(self.free.get(&a.label).copied())
         }
-        async fn list_files(&self, a: &Account, _: &str) -> Result<HashMap<String, u64>, Error> {
-            Ok(self
-                .existing
-                .get(&a.label)
-                .into_iter()
-                .flatten()
-                .map(|p| (p.clone(), 0))
-                .collect())
+        async fn list_files(&self, a: &Account, _: &str) -> Result<Listing, Error> {
+            Ok(Listing::from_entries(
+                self.existing
+                    .get(&a.label)
+                    .into_iter()
+                    .flatten()
+                    .map(|p| (p.clone(), 0)),
+            ))
         }
         async fn download(&self, _: &Account, _: &str, _: &Path, _: &str) -> Result<(), Error> {
             Err(Error::Remote("not used by put".into()))
@@ -734,5 +775,23 @@ mod tests {
         .await;
         assert!(matches!(result, Err(Error::DuplicateAccount(_))));
         assert!(remote.uploads.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_name_seen_twice_is_ambiguous_not_silently_one_of_them() {
+        let l = Listing::from_entries([
+            ("a".to_owned(), 1),
+            ("dup".to_owned(), 5),
+            ("dup".to_owned(), 9),
+            ("b".to_owned(), 2),
+        ]);
+        assert_eq!(l.files.len(), 2);
+        assert!(!l.files.contains_key("dup"), "no size to trust");
+        assert_eq!(l.duplicates.iter().collect::<Vec<_>>(), ["dup"]);
+        assert_eq!(
+            l.paths().count(),
+            3,
+            "ambiguous names still count as present"
+        );
     }
 }
