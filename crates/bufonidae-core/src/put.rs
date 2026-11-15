@@ -265,6 +265,21 @@ fn changed_since_scan(file: &LocalFile) -> bool {
         .map_or(true, |(len, time)| len != file.size || time != file.mtime)
 }
 
+/// A step of a running [`put_observed`], for progress displays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// The batch is planned. A file with two copies counts twice.
+    Planned { copies: usize, bytes: u64 },
+    /// One copy was stored.
+    Copied {
+        rel: String,
+        account: String,
+        size: u64,
+    },
+    /// One copy failed.
+    Failed { rel: String, reason: String },
+}
+
 /// Copies `sources` into `dest` on the given `accounts`.
 pub async fn put<R: RemoteFs>(
     remote: &R,
@@ -274,6 +289,31 @@ pub async fn put<R: RemoteFs>(
     config: &Config,
     sources: &[PathBuf],
     dest: &str,
+) -> Result<Report, Error> {
+    put_observed(
+        remote,
+        index,
+        accounts,
+        policy,
+        config,
+        sources,
+        dest,
+        &mut |_| {},
+    )
+    .await
+}
+
+/// [`put`], reporting each step to `observer` as it happens.
+#[allow(clippy::too_many_arguments)]
+pub async fn put_observed<R: RemoteFs>(
+    remote: &R,
+    index: &Index,
+    accounts: &[Account],
+    policy: &impl Placement,
+    config: &Config,
+    sources: &[PathBuf],
+    dest: &str,
+    observer: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Report, Error> {
     let dest = normalize_dest(dest)?;
     let scan = scan(sources)?;
@@ -313,6 +353,14 @@ pub async fn put<R: RemoteFs>(
         })
         .collect();
     let plan = plan_batch_copies(policy, &spaces, &wanted);
+    observer(Progress::Planned {
+        copies: plan.iter().flatten().map(Vec::len).sum(),
+        bytes: todo
+            .iter()
+            .zip(&plan)
+            .map(|(f, p)| f.size * p.as_ref().map_or(0, |ids| ids.len() as u64))
+            .sum(),
+    });
 
     for (file, chosen) in todo.iter().zip(plan) {
         // `None`: not enough accounts or space for every wanted copy.
@@ -348,13 +396,23 @@ pub async fn put<R: RemoteFs>(
                     report
                         .uploaded
                         .push((file.rel.clone(), account.label.clone(), file.size));
+                    observer(Progress::Copied {
+                        rel: file.rel.clone(),
+                        account: account.label.clone(),
+                        size: file.size,
+                    });
                 }
                 // Left `pending` on purpose: a failed upload may have left a
                 // partial file for `reconcile` to find. The other copies are
                 // still attempted; `repair` completes the set later.
-                Err(e) => report
-                    .failed
-                    .push((file.rel.clone(), format!("{}: {e}", account.label))),
+                Err(e) => {
+                    let reason = format!("{}: {e}", account.label);
+                    observer(Progress::Failed {
+                        rel: file.rel.clone(),
+                        reason: reason.clone(),
+                    });
+                    report.failed.push((file.rel.clone(), reason));
+                }
             }
         }
     }
@@ -612,5 +670,40 @@ mod tests {
         let by_path = |p: &str| files.iter().find(|f| f.path == p).unwrap().accounts.len();
         assert_eq!(by_path("Pics/photos/a.bin"), 1);
         assert_eq!(by_path("Pics/photos/sub/b.bin"), 2);
+    }
+
+    #[tokio::test]
+    async fn observer_sees_the_plan_and_every_copy() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000), ("two", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let mut events = Vec::new();
+        let report = put_observed(
+            &remote,
+            &index,
+            &[account("one"), account("two")],
+            &MostFreeSpace::default(),
+            &mirror(2),
+            &[dir.path().join("photos")],
+            "Pics",
+            &mut |p| events.push(p),
+        )
+        .await
+        .unwrap();
+        assert!(report.is_complete());
+        // photos/a.bin = 60 bytes, photos/sub/b.bin = 50 bytes, two copies each.
+        assert_eq!(
+            events[0],
+            Progress::Planned {
+                copies: 4,
+                bytes: 220
+            }
+        );
+        let copied = events
+            .iter()
+            .filter(|e| matches!(e, Progress::Copied { .. }))
+            .count();
+        assert_eq!(copied, 4);
+        assert_eq!(events.len(), 5);
     }
 }

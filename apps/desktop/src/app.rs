@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
+use std::path::PathBuf;
+
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Render, Styled as _, Window, div, px,
+    AnyElement, AppContext as _, Context, Entity, ExternalPaths, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, Styled as _, Window,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _,
@@ -15,7 +18,14 @@ use gpui_component::{
 use crate::add_account::{AddAccountForm, FormEvent};
 use crate::backend::{Backend, Snapshot, StartupError};
 use crate::format;
+use crate::store::{StoreEvent, StoreForm};
 use crate::theme;
+
+/// The dialog on top of the window, if any. One at a time.
+enum Modal {
+    AddAccount(Entity<AddAccountForm>),
+    Store(Entity<StoreForm>),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -33,8 +43,7 @@ pub struct BufonidaeApp {
     backend: Result<Arc<Backend>, StartupError>,
     screen: Screen,
     data: Data,
-    /// The open "Add account" modal, if any.
-    modal: Option<Entity<AddAccountForm>>,
+    modal: Option<Modal>,
 }
 
 impl BufonidaeApp {
@@ -82,8 +91,54 @@ impl BufonidaeApp {
             cx.notify();
         })
         .detach();
-        self.modal = Some(form);
+        self.modal = Some(Modal::AddAccount(form));
         cx.notify();
+    }
+
+    /// Opens the "Store files" dialog for `paths` (dropped or picked).
+    pub(crate) fn open_store(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        // A drop onto an open dialog is ignored rather than stacked.
+        if self.modal.is_some() || paths.is_empty() {
+            return;
+        }
+        let backend = Arc::clone(backend);
+        let form = cx.new(|cx| StoreForm::new(backend, paths, window, cx));
+        cx.subscribe(&form, |this, _form, event: &StoreEvent, cx| {
+            this.modal = None;
+            let StoreEvent::Closed { changed } = event;
+            if *changed {
+                this.reload(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        self.modal = Some(Modal::Store(form));
+        cx.notify();
+    }
+
+    /// Asks the system for files or folders to store.
+    pub(crate) fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some("Store".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = picked.await {
+                this.update_in(cx, |this, window, cx| this.open_store(paths, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -192,7 +247,11 @@ impl Render for BufonidaeApp {
                 .into_any_element();
         }
 
-        let overlay = self.modal.clone().map(|form| {
+        let overlay = self.modal.as_ref().map(|modal| match modal {
+            Modal::AddAccount(form) => form.clone().into_any_element(),
+            Modal::Store(form) => form.clone().into_any_element(),
+        });
+        let overlay = overlay.map(|form| {
             // A scrim over the whole window with the form centred on it.
             // Escape closes the form unless a sign-in is running.
             div()
@@ -204,25 +263,40 @@ impl Render for BufonidaeApp {
                 .justify_center()
                 .bg(cx.theme().overlay)
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape"
-                        && let Some(form) = &this.modal
-                    {
-                        form.update(cx, |form, cx| form.cancel(cx));
+                    if event.keystroke.key != "escape" {
+                        return;
+                    }
+                    match &this.modal {
+                        Some(Modal::AddAccount(form)) => form.update(cx, |f, cx| f.cancel(cx)),
+                        Some(Modal::Store(form)) => form.update(cx, |f, cx| f.cancel(cx)),
+                        None => {}
                     }
                 }))
                 .child(form)
         });
 
+        // Dropping files anywhere on the window opens the store dialog; while
+        // dragging, the window is tinted to say it is a drop target.
+        let drop_tint = cx.theme().accent;
         base.relative()
             .child(
-                div().size_full().h_flex().child(self.sidebar(cx)).child(
-                    div()
-                        .v_flex()
-                        .flex_1()
-                        .h_full()
-                        .min_w(px(0.0))
-                        .child(self.body(window, cx)),
-                ),
+                div()
+                    .id("window-content")
+                    .size_full()
+                    .h_flex()
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.open_store(paths.paths().to_vec(), window, cx);
+                    }))
+                    .child(self.sidebar(cx))
+                    .child(
+                        div()
+                            .v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(0.0))
+                            .child(self.body(window, cx)),
+                    ),
             )
             .children(overlay)
             .into_any_element()

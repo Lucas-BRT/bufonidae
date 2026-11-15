@@ -4,6 +4,7 @@ mod app;
 mod backend;
 mod files;
 mod format;
+mod store;
 mod theme;
 
 use std::sync::Arc;

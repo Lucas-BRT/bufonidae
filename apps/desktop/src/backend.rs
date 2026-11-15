@@ -5,12 +5,17 @@
 use std::sync::Arc;
 
 use bufonidae_core::account::{Account, AccountStore};
+use bufonidae_core::config::Config;
 use bufonidae_core::index::{self, Index, IndexedFile};
 use bufonidae_core::manager::{self, SharedSecrets};
+use bufonidae_core::placement::MostFreeSpace;
+use bufonidae_core::put::{self, Progress};
 use bufonidae_core::secrets::KeyringStore;
 use bufonidae_rclone::Error as RcloneError;
 use bufonidae_rclone::rcd::Rcd;
+use std::path::PathBuf;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 
 /// Why the app could not start.
@@ -82,6 +87,81 @@ impl Backend {
         })
     }
 
+    /// Looks at what was dropped and at the settings, without touching Mega.
+    pub fn inspect(&self, paths: Vec<PathBuf>) -> JoinHandle<Result<Inspection, String>> {
+        self.runtime.spawn(async move {
+            let scan = tokio::task::spawn_blocking(move || put::scan(&paths))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            let accounts =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?
+                    .list()
+                    .len();
+            let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            Ok(Inspection {
+                files: scan.files.len(),
+                bytes: scan.files.iter().map(|f| f.size).sum(),
+                skipped: scan.skipped.len(),
+                accounts,
+                config,
+            })
+        })
+    }
+
+    /// Stores `paths` under `dest` on the connected accounts, following the
+    /// redundancy settings. Progress arrives on `events` as it happens.
+    pub fn store(&self, paths: Vec<PathBuf>, dest: String) -> StoreJob {
+        let (tx, events) = unbounded_channel();
+        let index = Arc::clone(&self.index);
+        let result = self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let accounts = store.list().to_vec();
+            if accounts.is_empty() {
+                return Err("Connect a Mega account first.".to_owned());
+            }
+            let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+
+            let rcd = Rcd::start("rclone").await.map_err(|e| match e {
+                RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
+                }
+                e => e.to_string(),
+            })?;
+            let secrets: SharedSecrets = Arc::new(KeyringStore);
+            let outcome = async {
+                // Every account is used, so every account must connect.
+                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
+                    result.map_err(|e| format!("Account {:?}: {e}", account.label))?;
+                }
+                put::put_observed(
+                    &rcd,
+                    &index,
+                    &accounts,
+                    &MostFreeSpace::default(),
+                    &config,
+                    &paths,
+                    &dest,
+                    &mut |progress| {
+                        // The receiver may be gone (window closed); the store goes on.
+                        let _ = tx.send(progress);
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = rcd.shutdown().await;
+            outcome
+        });
+        StoreJob { events, result }
+    }
+
     /// Connects a Mega account: proves the login through rclone, then stores
     /// the account and its secrets. Nothing is kept when it fails.
     pub fn add_account(&self, request: NewAccount) -> JoinHandle<Result<(), String>> {
@@ -114,6 +194,24 @@ impl Backend {
             result.map(|_| ()).map_err(|e| e.to_string())
         })
     }
+}
+
+/// What the store dialog needs to know before it starts: how big the drop is
+/// and whether the accounts can satisfy the redundancy settings.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub files: usize,
+    pub bytes: u64,
+    /// Symlinks and unsupported names, which are never uploaded.
+    pub skipped: usize,
+    pub accounts: usize,
+    pub config: Config,
+}
+
+/// A running store job: progress events, then the final report.
+pub struct StoreJob {
+    pub events: UnboundedReceiver<Progress>,
+    pub result: JoinHandle<Result<put::Report, String>>,
 }
 
 /// What the "add account" form submits. The password is only held until the

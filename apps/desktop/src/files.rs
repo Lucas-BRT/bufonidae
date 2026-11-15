@@ -4,7 +4,10 @@ use gpui::{
     Context, IntoElement, ParentElement as _, Styled as _, Window, div, prelude::*, px,
     uniform_list,
 };
-use gpui_component::{ActiveTheme as _, Icon, IconName, StyledExt as _};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, StyledExt as _,
+    button::{Button, ButtonVariants as _},
+};
 
 use crate::app::{BufonidaeApp, centered};
 use crate::backend::Snapshot;
@@ -22,28 +25,39 @@ impl BufonidaeApp {
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
 
+        let add_files = Button::new("add-files")
+            .primary()
+            .icon(IconName::Plus)
+            .label("Add files")
+            .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
+
         let header = div()
-            .v_flex()
-            .gap_1()
+            .h_flex()
+            .items_start()
+            .justify_between()
+            .gap_4()
             .px_6()
             .pt_6()
             .pb_4()
-            .child(div().text_2xl().font_semibold().child("Files"))
-            .child(div().text_color(muted).child(format!(
-                "{} · {}",
-                format::files(snapshot.files.len()),
-                format::bytes(snapshot.total_bytes())
-            )));
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .child(div().text_2xl().font_semibold().child("Files"))
+                    .child(div().text_color(muted).child(format!(
+                        "{} · {}",
+                        format::files(snapshot.files.len()),
+                        format::bytes(snapshot.total_bytes())
+                    ))),
+            )
+            .child(add_files);
 
         if snapshot.files.is_empty() {
             return div().v_flex().size_full().child(header).child(centered(
                 cx,
                 Some(IconName::Inbox),
                 "Nothing stored yet",
-                Some(
-                    "Store files from a terminal with `bufonidae put`, and they will show up here."
-                        .to_owned(),
-                ),
+                Some("Drop files or folders anywhere on this window, or use Add files.".to_owned()),
             ));
         }
 
