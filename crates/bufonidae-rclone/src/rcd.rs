@@ -167,6 +167,22 @@ impl Rcd {
         Ok(response.list)
     }
 
+    /// `operations/list` with `recurse` and `filesOnly`: every file under
+    /// `remote`, with paths relative to it.
+    pub async fn list_files_recursive(&self, fs: &str, remote: &str) -> Result<Vec<Entry>, Error> {
+        let response: ListResponse = self
+            .call(
+                "operations/list",
+                &json!({
+                    "fs": fs,
+                    "remote": remote,
+                    "opt": { "recurse": true, "filesOnly": true },
+                }),
+            )
+            .await?;
+        Ok(response.list)
+    }
+
     /// `operations/copyfile`: copies one file between (possibly different) remotes.
     pub async fn copy_file(
         &self,

@@ -6,4 +6,5 @@
 pub mod account;
 pub mod manager;
 pub mod placement;
+pub mod put;
 pub mod secrets;

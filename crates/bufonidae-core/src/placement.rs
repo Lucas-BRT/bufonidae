@@ -35,6 +35,31 @@ impl Placement for MostFreeSpace {
     }
 }
 
+/// Places a batch of files, largest first (first-fit-decreasing), tracking the
+/// space each placement consumes. Returns, for each entry of `sizes` and in
+/// the same order, the chosen account or `None` when nothing could hold it.
+#[must_use]
+pub fn plan_batch(
+    policy: &impl Placement,
+    accounts: &[AccountSpace],
+    sizes: &[u64],
+) -> Vec<Option<AccountId>> {
+    let mut remaining = accounts.to_vec();
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
+
+    let mut plan = vec![None; sizes.len()];
+    for i in order {
+        if let Some(id) = policy.choose(&remaining, sizes[i]) {
+            if let Some(a) = remaining.iter_mut().find(|a| a.id == id) {
+                a.free_bytes = a.free_bytes.saturating_sub(sizes[i]);
+            }
+            plan[i] = Some(id);
+        }
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +91,33 @@ mod tests {
         let accounts = [acc(1, u64::MAX)];
         let policy = MostFreeSpace { headroom_bytes: 1 };
         assert_eq!(policy.choose(&accounts, u64::MAX), None);
+    }
+
+    #[test]
+    fn batch_spreads_files_and_reports_unplaced() {
+        let accounts = [acc(1, 100), acc(2, 100)];
+        let plan = plan_batch(&MostFreeSpace::default(), &accounts, &[60, 60, 50, 500]);
+        assert_eq!(plan[3], None);
+        // After the two 60s each account has 40 left: the 50 fits nowhere.
+        assert_eq!(plan[2], None);
+        assert!(plan[0].is_some() && plan[1].is_some());
+        assert_ne!(plan[0], plan[1]);
+    }
+
+    #[test]
+    fn batch_never_overcommits_an_account() {
+        let accounts = [acc(1, 100), acc(2, 30)];
+        let sizes = [40, 40, 20, 10];
+        let plan = plan_batch(&MostFreeSpace::default(), &accounts, &sizes);
+        for a in &accounts {
+            let used: u64 = plan
+                .iter()
+                .zip(sizes)
+                .filter(|(p, _)| **p == Some(a.id))
+                .map(|(_, s)| s)
+                .sum();
+            assert!(used <= a.free_bytes);
+        }
+        assert!(plan.iter().all(Option::is_some));
     }
 }

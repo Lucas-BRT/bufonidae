@@ -3,6 +3,8 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use bufonidae_core::account::AccountStore;
 use bufonidae_core::manager::{self, SharedSecrets};
+use bufonidae_core::placement::MostFreeSpace;
+use bufonidae_core::put;
 use bufonidae_core::secrets::KeyringStore;
 use bufonidae_rclone::rcd::Rcd;
 use clap::{Parser, Subcommand};
@@ -17,6 +19,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Copy files or folders into the pool, spreading files across accounts.
+    Put {
+        /// Files and folders to upload.
+        #[arg(required = true)]
+        paths: Vec<std::path::PathBuf>,
+        /// Destination folder inside the accounts, e.g. `Photos/2026`.
+        #[arg(long)]
+        to: String,
+        /// Accounts to use (default: all connected accounts).
+        #[arg(long, value_delimiter = ',')]
+        accounts: Vec<String>,
+    },
     /// Manage connected Mega accounts.
     #[command(subcommand)]
     Account(AccountCommand),
@@ -47,6 +61,48 @@ async fn main() -> Result<()> {
     let secrets: SharedSecrets = Arc::new(KeyringStore);
 
     match cli.command {
+        Command::Put {
+            paths,
+            to,
+            accounts,
+        } => {
+            let chosen: Vec<_> = if accounts.is_empty() {
+                store.list().to_vec()
+            } else {
+                accounts
+                    .iter()
+                    .map(|l| {
+                        store
+                            .find(l)
+                            .cloned()
+                            .with_context(|| format!("no account labelled {l:?}"))
+                    })
+                    .collect::<Result<_>>()?
+            };
+            if chosen.is_empty() {
+                bail!("no accounts connected; run `bufonidae account add` first");
+            }
+            let rcd = Rcd::start("rclone")
+                .await
+                .context("could not start rclone; is it installed and on PATH?")?;
+            let result = async {
+                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
+                    if chosen.iter().any(|c| c.id == account.id) {
+                        result.with_context(|| format!("account {:?}", account.label))?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(
+                    put::put(&rcd, &chosen, &MostFreeSpace::default(), &paths, &to).await?,
+                )
+            }
+            .await;
+            rcd.shutdown().await?;
+            let report = result?;
+            print_report(&report);
+            if !report.is_complete() {
+                std::process::exit(1);
+            }
+        }
         Command::Account(AccountCommand::List) => {
             for a in store.list() {
                 println!("{}\t{}", a.label, a.email);
@@ -79,4 +135,22 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_report(report: &put::Report) {
+    for (rel, label, size) in &report.uploaded {
+        println!("uploaded  {rel}  ->  {label}  ({size} bytes)");
+    }
+    for rel in &report.already_there {
+        println!("exists    {rel}");
+    }
+    for path in &report.skipped {
+        println!("skipped   {} (symlink or unsupported name)", path.display());
+    }
+    for rel in &report.no_room {
+        eprintln!("NO ROOM   {rel}");
+    }
+    for (rel, reason) in &report.failed {
+        eprintln!("FAILED    {rel}: {reason}");
+    }
 }
