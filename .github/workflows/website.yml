@@ -1,0 +1,54 @@
+name: Website
+
+# Builds the site's image exactly as it is deployed and checks it runs. It does
+# not push anything.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - "vendor/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/bufonidae-rclone/src/lib.rs"
+      - "crates/bufonidae-cli/src/main.rs"
+      - ".github/workflows/website.yml"
+  pull_request:
+    paths:
+      - "website/**"
+      - "vendor/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/bufonidae-rclone/src/lib.rs"
+      - "crates/bufonidae-cli/src/main.rs"
+      - ".github/workflows/website.yml"
+
+concurrency:
+  group: website-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -f website/Dockerfile -t bufonidae-website:ci .
+      - name: Run it the way compose does and check it answers
+        run: |
+          docker run -d --name site --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --memory 64m --pids-limit 64 \
+            -p 127.0.0.1:3000:3000 bufonidae-website:ci
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fsS http://127.0.0.1:3000/ >/dev/null && break
+            sleep 1
+          done
+          for path in / /install /recovery /security /style.css; do
+            curl -fsS "http://127.0.0.1:3000$path" >/dev/null
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/no-such-page)" = 404
+          docker exec site /server --health

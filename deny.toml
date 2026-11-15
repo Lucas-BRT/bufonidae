@@ -1,0 +1,67 @@
+# Policy for `cargo deny check`: licenses, security advisories, banned or
+# duplicated crates, and where crates may come from.
+
+[graph]
+# The only platform that is built and shipped.
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every entry is an "unmaintained" notice, not a vulnerability, for a crate
+# that is only a dependency of a dependency. Each is listed with where it comes
+# from so that it stays visible; the weekly audit runs this check again.
+ignore = [
+    { id = "RUSTSEC-2024-0384", reason = "instant: Unmaintained, informational (no vulnerability). Comes in through turso; revisit when it is upgraded." },
+    { id = "RUSTSEC-2024-0436", reason = "paste: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2025-0052", reason = "async-std: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: Unmaintained, informational (no vulnerability). Comes in through the keyring (zbus) and gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: Unmaintained, informational (no vulnerability). Comes in through the keyring (zbus) and gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: Unmaintained, informational (no vulnerability). Comes in through the keyring (zbus) and gpui; revisit when it is upgraded." },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils: Unmaintained, informational (no vulnerability). Comes in through gpui; revisit when it is upgraded." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive licenses only, plus MPL-2.0 (option-ext, used unmodified: its
+# copyleft covers its own files). No GPL: `self_cell` is "Apache-2.0 OR
+# GPL-2.0-only" and is taken under the Apache license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "0BSD",
+    "MIT-0",
+    "BSL-1.0",
+    "BlueOak-1.0.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# Known and accepted: `cargo deny` warns that cfg_block (a dependency of turso)
+# has no license field. Its LICENSE file is the Apache License 2.0, so it is
+# covered by the allow list above; a license clarification was tried and did not
+# apply, so there is none rather than a misleading one.

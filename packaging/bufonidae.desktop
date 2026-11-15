@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Bufonidae
+GenericName=Mega account pool
+Comment=Spread files across several Mega accounts
+Exec=bufonidae-desktop
+Icon=bufonidae
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=mega;rclone;cloud;storage;backup;
+StartupWMClass=bufonidae

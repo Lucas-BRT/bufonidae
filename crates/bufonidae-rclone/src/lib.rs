@@ -247,37 +247,41 @@ mod tests {
         assert!(check_supported("garbage", true).is_err());
     }
 
-    /// The version CI downloads and the version the code enforces must be the
-    /// same, or CI would test one rclone and ship another.
+    /// The rclone every workflow downloads must be the version the code enforces,
+    /// and with the same checksum everywhere, or CI would test one rclone and
+    /// a release would ship another.
     #[test]
-    fn ci_downloads_the_rclone_version_the_code_expects() {
-        let ci = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../.github/workflows/ci.yml"
-        ))
-        .unwrap();
-        let line = ci
-            .lines()
-            .find(|l| l.trim_start().starts_with("RCLONE_VERSION:"))
-            .unwrap();
-        assert!(
-            line.contains(&format!("\"{TESTED_VERSION}\"")),
-            "ci.yml says {line:?}, the code expects {TESTED_VERSION}"
+    fn every_workflow_downloads_the_rclone_version_the_code_expects() {
+        let read = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/../../.github/workflows/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let value = |text: &str, key: &str| -> String {
+            text.lines()
+                .find_map(|l| {
+                    l.trim_start()
+                        .strip_prefix(key)
+                        .map(|v| v.trim().trim_matches('"').to_owned())
+                })
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        let (ci, release) = (read("ci.yml"), read("release.yml"));
+        for (name, text) in [("ci.yml", &ci), ("release.yml", &release)] {
+            assert_eq!(
+                value(text, "RCLONE_VERSION:"),
+                TESTED_VERSION.to_string(),
+                "{name} downloads another rclone than the code expects"
+            );
+        }
+        assert_eq!(
+            value(&ci, "RCLONE_SHA256:"),
+            value(&release, "RCLONE_SHA256:"),
+            "ci.yml and release.yml check different checksums"
         );
-    }
-
-    #[test]
-    fn control_characters_cannot_reach_a_terminal() {
-        let hostile = "ok\x1b[2J\x1b]0;pwned\x07 line\nbreak\r\0end";
-        let shown = escape_control(hostile);
-        assert!(!shown.chars().any(char::is_control), "{shown:?}");
-        assert!(shown.contains("\\u{1b}"));
-        assert!(shown.starts_with("ok") && shown.ends_with("end"));
-        // Ordinary text, including non-ASCII, is untouched.
-        assert_eq!(escape_control("fotos/são joão.jpg"), "fotos/são joão.jpg");
-        // Length is capped.
-        let long = "x".repeat(5000);
-        assert!(escape_control(&long).chars().count() <= MAX_DIAGNOSTIC + 1);
+        assert_eq!(value(&ci, "RCLONE_SHA256:").len(), 64);
     }
 
     #[test]

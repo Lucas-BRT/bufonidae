@@ -1,0 +1,127 @@
+name: Release
+
+# Runs when a version tag is pushed. It builds, tests and packages, then makes a
+# DRAFT pre-release: nothing is published until a person reviews it and presses
+# Publish. Not cancelled by a newer push: a release must finish.
+#
+# Started by hand (workflow_dispatch) it does everything except the tag checks
+# and the release: the packages are kept as a workflow artifact, so the whole
+# pipeline can be tried without tagging anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  # The rclone shipped in the packages, and used by the integration tests. Must
+  # equal the version in ci.yml and in the code (a test keeps them identical).
+  RCLONE_VERSION: "1.76.0"
+  RCLONE_SHA256: b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7
+  BUFONIDAE_REQUIRE_RCLONE: "1"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # to create the draft release
+      id-token: write # to sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+
+      - name: The tag must match the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $VERSION in Cargo.toml" >&2
+            exit 1
+          fi
+
+      - name: The changelog must have notes for this version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            /^## \[/ { on = 0 }
+            on
+          ' CHANGELOG.md >release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "CHANGELOG.md has no '## [$VERSION]' section with notes" >&2
+            exit 1
+          fi
+
+      # System libraries gpui links against.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig-dev libfreetype-dev
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: bufonidae-release
+
+      - name: Download rclone (checked against its SHA-256)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/rclone.zip" \
+            "https://downloads.rclone.org/v$RCLONE_VERSION/rclone-v$RCLONE_VERSION-linux-amd64.zip"
+          echo "$RCLONE_SHA256  $RUNNER_TEMP/rclone.zip" | sha256sum --check --quiet -
+          unzip -q "$RUNNER_TEMP/rclone.zip" -d "$RUNNER_TEMP"
+          install -D -m 0755 "$RUNNER_TEMP/rclone-v$RCLONE_VERSION-linux-amd64/rclone" "$RUNNER_TEMP/bin/rclone"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      # The same checks as CI: a tag on a red commit must not ship.
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+      - run: cargo build --release --locked -p bufonidae-cli -p bufonidae-desktop
+
+      - name: Package
+        run: |
+          packaging/build-packages.sh "$VERSION" target/release "$RUNNER_TEMP/bin/rclone" dist
+          # What was packaged must actually run.
+          tar -xzf "dist/bufonidae-$VERSION-linux-x86_64.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/bufonidae-$VERSION-linux-x86_64/bin/bufonidae" --version
+          "$RUNNER_TEMP/bufonidae-$VERSION-linux-x86_64/libexec/bufonidae/rclone" version | head -n1
+
+      # Artifact attestations need a public repository on the free plan.
+      - name: Attest build provenance
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+
+      # A manual run keeps the packages here instead of releasing them.
+      - name: Keep the packages (manual run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Create the draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft --prerelease \
+            --title "Bufonidae $VERSION" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/*.deb dist/SHA256SUMS

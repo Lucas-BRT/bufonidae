@@ -12,6 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_AUDIT_VERSION: "0.23.0"
+  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   cargo-audit:
@@ -27,3 +28,19 @@ jobs:
       - if: steps.tool.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
       - run: cargo audit
+
+  # Licenses, advisories, banned or duplicated crates and crate sources, by the
+  # policy in deny.toml.
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: tool
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}
+      - if: steps.tool.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+      - run: cargo deny --locked check
