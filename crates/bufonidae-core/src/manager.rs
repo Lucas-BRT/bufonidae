@@ -155,6 +155,55 @@ async fn persist_after_login(
     outcome
 }
 
+/// Signs an existing account in again with a (new) password, for example after
+/// a restore or a password change. The account keeps its id, so the index
+/// still refers to it. Nothing changes unless the login is proven.
+pub async fn reauthorize(
+    rcd: &Rcd,
+    store: &AccountStore,
+    secrets: &SharedSecrets,
+    label: &str,
+    password: &str,
+    two_fa: Option<&str>,
+) -> Result<Account, Error> {
+    let account = store
+        .find(label)
+        .cloned()
+        .ok_or_else(|| account::Error::NotFound(label.to_owned()))?;
+    let remote = account.remote_name();
+
+    create_remote(rcd, &account, password, two_fa, None).await?;
+    let result = async {
+        rcd.about(&format!("{remote}:"))
+            .await
+            .map_err(|source| Error::Login {
+                email: account.email.clone(),
+                source,
+            })?;
+        secret_set(secrets, &account, SecretKind::Password, password.to_owned()).await?;
+        // The old session belongs to the old password: replace it or drop it.
+        let stored = rcd.config_get(&remote).await?;
+        match (stored.get("session_id"), stored.get("master_key")) {
+            (Some(id), Some(key)) => {
+                secret_set(secrets, &account, SecretKind::SessionId, id.clone()).await?;
+                secret_set(secrets, &account, SecretKind::MasterKey, key.clone()).await?;
+            }
+            _ => {
+                for kind in [SecretKind::SessionId, SecretKind::MasterKey] {
+                    let (secrets, id) = (Arc::clone(secrets), account.id.clone());
+                    tokio::task::spawn_blocking(move || secrets.delete(&id, kind)).await??;
+                }
+            }
+        }
+        Ok::<(), Error>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = rcd.config_delete(&remote).await;
+    }
+    result.map(|()| account)
+}
+
 /// Defines the remote of every stored account in the daemon, from the stored
 /// password (and session, when there is one). Returns one result per account
 /// so that a single bad account does not hide the others.
@@ -224,5 +273,24 @@ mod tests {
             None
         );
         assert!(remove_account(&mut store, &secrets, "work").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reauthorizing_an_unknown_label_fails_without_touching_anything() {
+        let Ok(rcd) = Rcd::start("rclone").await else {
+            if std::env::var_os("BUFONIDAE_REQUIRE_RCLONE").is_some() {
+                panic!("rclone is required");
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::load(dir.path().join("accounts.toml")).unwrap();
+        let secrets: SharedSecrets = Arc::new(MemoryStore::default());
+        let result = reauthorize(&rcd, &store, &secrets, "nobody", "pw", None).await;
+        assert!(matches!(
+            result,
+            Err(Error::Account(account::Error::NotFound(_)))
+        ));
+        rcd.shutdown().await.unwrap();
     }
 }

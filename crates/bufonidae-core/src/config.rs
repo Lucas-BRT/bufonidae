@@ -52,7 +52,7 @@ fn default_large_upload() -> u64 {
 
 /// Redundancy settings. `copies` = number of copies on distinct accounts:
 /// 1 is `single` (JBOD, no redundancy), N >= 2 is `mirror:N`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "one")]
     default_copies: u8,
@@ -66,6 +66,18 @@ pub struct Config {
     #[serde(skip)]
     path: PathBuf,
 }
+
+/// Two configs are equal when their settings are, wherever each was loaded
+/// from.
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.default_copies == other.default_copies
+            && self.folders == other.folders
+            && self.large_upload_bytes == other.large_upload_bytes
+    }
+}
+
+impl Eq for Config {}
 
 impl Default for Config {
     fn default() -> Self {
@@ -152,6 +164,23 @@ impl Config {
     #[must_use]
     pub fn default_copies(&self) -> u8 {
         self.default_copies
+    }
+
+    /// Replaces every setting with those of `other` (an exported copy) and
+    /// saves. `other` is validated like a hand-edited file would be.
+    pub fn restore_from(&mut self, other: &Self) -> Result<(), Error> {
+        let valid = |n: u8| (1..=MAX_COPIES).contains(&n);
+        if !valid(other.default_copies) || !other.folders.values().all(|&n| valid(n)) {
+            return Err(Error::InvalidLevel("in the imported settings".to_owned()));
+        }
+        let mut folders = BTreeMap::new();
+        for (folder, &copies) in &other.folders {
+            folders.insert(normalize_folder(folder)?, copies);
+        }
+        self.default_copies = other.default_copies;
+        self.folders = folders;
+        self.large_upload_bytes = other.large_upload_bytes;
+        self.save()
     }
 
     #[must_use]

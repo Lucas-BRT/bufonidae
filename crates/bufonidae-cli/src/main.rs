@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use bufonidae_core::account::AccountStore;
 use bufonidae_core::config::{self, Config};
+use bufonidae_core::export;
 use bufonidae_core::get;
 use bufonidae_core::index::Index;
 use bufonidae_core::manager::{self, SharedSecrets};
@@ -70,6 +71,17 @@ enum Command {
     /// How many copies of each file to keep, like a RAID level.
     #[command(subcommand)]
     Redundancy(RedundancyCommand),
+    /// Write a portable backup (accounts without secrets, settings, which
+    /// account holds which file) to a JSON file.
+    Export {
+        file: std::path::PathBuf,
+        /// Replace the file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Restore a backup made by `export` into an empty profile. Accounts come
+    /// back without passwords: sign each in with `account reauth`.
+    Import { file: std::path::PathBuf },
     /// Manage connected Mega accounts.
     #[command(subcommand)]
     Account(AccountCommand),
@@ -104,6 +116,9 @@ enum AccountCommand {
     },
     /// List connected accounts.
     List,
+    /// Sign an existing account in again, e.g. after a restore or a password
+    /// change. Asks for the password on the terminal.
+    Reauth { label: String },
     /// Disconnect an account and forget its stored secrets.
     Remove { label: String },
 }
@@ -117,6 +132,61 @@ async fn main() -> Result<()> {
 
     let config_path = Config::default_path()?;
     match cli.command {
+        Command::Export { file, force } => {
+            if file.exists() && !force {
+                bail!(
+                    "{} already exists; use --force to replace it",
+                    file.display()
+                );
+            }
+            let index = Index::open(&Index::default_path()?).await?;
+            let config = Config::load(&config_path)?;
+            let export = export::collect(&index, &store, &config).await?;
+            export::write(&file, &export)?;
+            println!(
+                "wrote {} ({} accounts, {} placements, {} lost files). It holds no passwords.",
+                file.display(),
+                export.accounts.len(),
+                export.placements.len(),
+                export.lost.len()
+            );
+        }
+        Command::Import { file } => {
+            let export = export::read(&file)?;
+            let index = Index::open(&Index::default_path()?).await?;
+            let mut config = Config::load(&config_path)?;
+            export::restore(&export, &index, &mut store, &mut config).await?;
+            println!(
+                "restored {} accounts and {} placements.",
+                export.accounts.len(),
+                export.placements.len()
+            );
+            for account in &export.accounts {
+                println!(
+                    "  sign in again:  bufonidae account reauth {}",
+                    account.label
+                );
+            }
+        }
+        Command::Account(AccountCommand::Reauth { label }) => {
+            if store.find(&label).is_none() {
+                bail!("no account labelled {label:?}");
+            }
+            let password = rpassword::prompt_password("Mega password: ")?;
+            if password.is_empty() {
+                bail!("empty password");
+            }
+            let code = rpassword::prompt_password("2FA code (empty if none): ")?;
+            let two_fa = (!code.is_empty()).then_some(code.as_str());
+            let rcd = Rcd::start("rclone")
+                .await
+                .context("could not start rclone; is it installed and on PATH?")?;
+            let result =
+                manager::reauthorize(&rcd, &store, &secrets, &label, &password, two_fa).await;
+            rcd.shutdown().await?;
+            let account = result?;
+            println!("signed in {} ({})", account.label, account.email);
+        }
         Command::Redundancy(cmd) => {
             let mut config = Config::load(&config_path)?;
             match cmd {

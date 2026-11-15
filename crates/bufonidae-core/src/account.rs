@@ -22,6 +22,10 @@ pub enum Error {
          look like they are on different accounts"
     )]
     DuplicateAccount { email: String, label: String },
+    #[error("the account list is not empty: restoring would mix two sets of accounts")]
+    NotEmpty,
+    #[error("invalid or repeated account id {0:?}")]
+    InvalidId(String),
     #[error("no account labelled {0:?}")]
     NotFound(String),
     #[error("could not determine the configuration directory")]
@@ -162,6 +166,41 @@ impl AccountStore {
         let account = self.prepare(label, email)?;
         self.commit(account.clone())?;
         Ok(account)
+    }
+
+    /// Loads exported accounts into an **empty** store, keeping their ids (the
+    /// index refers to them). Validates every entry like a new account.
+    pub fn restore(&mut self, accounts: Vec<Account>) -> Result<(), Error> {
+        if !self.file.accounts.is_empty() {
+            return Err(Error::NotEmpty);
+        }
+        let mut staged = AccountStore {
+            path: self.path.clone(),
+            file: File::default(),
+        };
+        for account in accounts {
+            let id_ok = !account.id.is_empty()
+                && account.id.len() <= 64
+                && account
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if !id_ok {
+                return Err(Error::InvalidId(account.id));
+            }
+            if staged.file.accounts.iter().any(|a| a.id == account.id) {
+                return Err(Error::InvalidId(account.id));
+            }
+            validate_label(&account.label)?;
+            if staged.find(&account.label).is_some() {
+                return Err(Error::DuplicateLabel(account.label));
+            }
+            staged.check_new_identity(&account.email)?;
+            staged.file.accounts.push(account);
+        }
+        staged.save()?;
+        self.file = staged.file;
+        Ok(())
     }
 
     /// Removes the account labelled `label` and saves the store.

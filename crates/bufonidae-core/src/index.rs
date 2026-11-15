@@ -405,6 +405,58 @@ impl Index {
         Ok(out)
     }
 
+    /// Loads exported rows into an **empty** index, all or nothing.
+    pub async fn import(&self, rows: &[Placement], lost: &[LostFile]) -> Result<(), Error> {
+        self.atomic(async |conn| {
+            let mut found = conn
+                .query(
+                    "SELECT (SELECT COUNT(*) FROM items) + (SELECT COUNT(*) FROM lost)",
+                    (),
+                )
+                .await?;
+            let existing: i64 = match found.next().await? {
+                Some(row) => row.get(0)?,
+                None => 0,
+            };
+            drop(found);
+            if existing > 0 {
+                return Err(turso::Error::Misuse(
+                    "the index is not empty; importing would mix two libraries".to_owned(),
+                ));
+            }
+            for row in rows {
+                let size = i64::try_from(row.size)
+                    .map_err(|_| turso::Error::Misuse(format!("{}: size too large", row.path)))?;
+                conn.execute(
+                    "INSERT INTO items (path, size) VALUES (?1, ?2)
+                     ON CONFLICT(path) DO NOTHING",
+                    params![row.path.as_str(), size],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO placements (path, account_id, state) VALUES (?1, ?2, ?3)",
+                    params![
+                        row.path.as_str(),
+                        row.account_id.as_str(),
+                        row.state.as_str()
+                    ],
+                )
+                .await?;
+            }
+            for file in lost {
+                let size = i64::try_from(file.size)
+                    .map_err(|_| turso::Error::Misuse(format!("{}: size too large", file.path)))?;
+                conn.execute(
+                    "INSERT INTO lost (path, size) VALUES (?1, ?2)",
+                    params![file.path.as_str(), size],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Uploads that were started and never confirmed.
     pub async fn pending(&self) -> Result<Vec<PendingPlacement>, Error> {
         let _turn = self.gate.lock().await;
