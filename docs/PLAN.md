@@ -1,6 +1,6 @@
 # Bufonidae — plan
 
-Linux desktop app (Rust) that aggregates N Mega.nz accounts into a single logical directory and distributes files among them, using `rclone` as the transfer engine.
+Linux desktop app (Rust) that aggregates N Mega.nz accounts into a single logical directory and distributes files among them, using `rclone` as the only transfer engine.
 
 ## 0. Repository conventions
 
@@ -30,11 +30,11 @@ Flow: `drop` (GUI/CLI/watch folder) → **planner** (core) picks a destination a
 | # | Problem | Solution |
 |---|---------|----------|
 | 1 | **Mega ToS** forbids circumventing quota limits; many free accounts may get banned. | Never automate account creation. Only connect accounts the user already owns. Explicit warning on first run. Documented in the README and website. |
-| 2 | **rsync does not speak Mega.** | rsync stays off the Mega path. Legitimate uses: local staging (`--partial --checksum`) from a watched folder, or local→local/NAS mirroring. Deferred until there is a concrete use case. Say so in the docs. |
+| 2 | **rsync does not speak Mega.** | Dropped: rclone is the only transfer engine. Local staging is handled by the planner (size/mtime snapshot before and after, see #20). |
 | 3 | **rclone's `mega` backend has no usable hashes or mtimes**: `--checksum` does not work, comparison is by size only. | Compute a local blake3 at upload time and store it in the index; verify integrity by size + indexed hash; `rclone check --size-only` as fallback. Confirm when pinning the rclone version. |
 | 4 | **Per-account transfer (bandwidth) quota**, besides storage. Downloads fail when it runs out. | Model two quotas per account: free space (`operations/about`) and an estimated bandwidth budget over a sliding window. Reads pick the replica/account with bandwidth left; backoff on quota errors. |
 | 5 | **Moving between accounts = download + upload** (no server-side cross-account move). Rebalancing is expensive. | Get placement right the first time. Rebalancing is manual/scheduled only, with a cost estimate shown first. |
-| 6 | **Bad placement**: large files, folders with many small files, folders that should stay together. | Pluggable policies (`Placement` trait): `most-free-space` (default), `round-robin`, `keep-folder-together` (whole folder on one account if it fits), `spread` (per file). First-fit-decreasing bin packing for batch drops. Configurable minimum headroom per account (e.g. 5%). Default granularity: per file, with keep-together as a per-folder option. |
+| 6 | **Bad placement**: large files, folders with many small files, folders that should stay together. | Pluggable policies (`Placement` trait): `most-free-space` (default), `round-robin`, `keep-folder-together` (whole folder on one account if it fits), `spread` (per file). First-fit-decreasing bin packing for batch drops. Configurable minimum headroom per account (e.g. 5%). Default granularity: per file (decided), with keep-together as a per-folder option. |
 | 7 | **File larger than any account's free space.** | Optional chunking: N MB parts on distinct accounts + manifest in the index. Phase 3; the MVP rejects with a clear error. Alternative: `rclone chunker` over `union` (to evaluate). |
 | 8 | **Losing an account loses part of the data** (no redundancy). | RAID-style redundancy, optional and configurable per pool, overridable per folder (see §3). UI shows "data at risk" per account. Exportable index. |
 | 9 | **Index drifts from reality** (someone edited via Mega's site, crash mid-transfer). | Source of truth = remote listing; the index is a cache. Write-ahead journal for recovery. A `reconcile` command/action (recursive `operations/list`) finds orphans, missing items and duplicates. |
@@ -72,11 +72,11 @@ The planner picks N distinct accounts per item; reads choose the healthiest copy
 1. **MVP-0**: workspace, CI, `bufonidae-rclone` (spawn rcd, list/about/copy), CLI `account add/list`, `put <path> --pool X`. Fake backend + planner tests.
 2. **MVP-1**: journal, reconcile, policies, quotas, unified `get`/`ls`, `mirror` redundancy, stable CLI.
 3. **MVP-2**: gpui desktop (accounts, pools, drag & drop, queue, account health).
-4. **Phase 3**: `parity`, chunking, watch folder (+ rsync staging if a use case appears), packaging, website.
+4. **Phase 3**: `parity`, chunking, watch folder, packaging, website.
 
 ## 6. Dependencies
 
-**System**: `rclone` (minimum version pinned after testing the mega backend), `rsync` (optional), Secret Service (gnome-keyring/kwallet), gpui libs: `libxkbcommon`, `wayland`, `libxcb`, Vulkan loader, `fontconfig`, `freetype`. Dev: `gh`, `docker`.
+**System**: `rclone` (minimum version pinned after testing the mega backend), Secret Service (gnome-keyring/kwallet), gpui libs: `libxkbcommon`, `wayland`, `libxcb`, Vulkan loader, `fontconfig`, `freetype`. Dev: `gh`, `docker`.
 
 **Rust, core/rclone/cli** (versions resolved with `cargo add`/`cargo info` at scaffold time and frozen in `Cargo.lock`; shared deps in `[workspace.dependencies]`):
 - `tokio` (rt, process, sync, time) — async, rcd supervisor
@@ -131,6 +131,11 @@ Other workflows:
 
 Private `Lucas-BRT/bufonidae` on GitHub, default branch `main`, MIT `LICENSE`, README and `AGENTS.md` (including the English-only rule).
 
-## 10. Open questions
+## 10. Decided
 
-- rsync use case (local staging / NAS mirror), or keep it deferred.
+- rclone is the only transfer engine; rsync is out of scope.
+- Default placement granularity: per file.
+
+## 11. Open questions
+
+None at the moment.
