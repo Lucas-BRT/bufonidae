@@ -29,6 +29,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "config file {0} was changed by another Bufonidae process while this one was working; \
+         run the command again"
+    )]
+    Changed(PathBuf),
     #[error("config file {path} is corrupt: {source}")]
     Parse {
         path: PathBuf,
@@ -65,6 +70,10 @@ pub struct Config {
     large_upload_bytes: u64,
     #[serde(skip)]
     path: PathBuf,
+    /// The file's text when it was last read or written (`None`: it did not
+    /// exist). A save refuses to go on if the file is no longer this.
+    #[serde(skip)]
+    baseline: Option<String>,
 }
 
 /// Two configs are equal when their settings are, wherever each was loaded
@@ -86,6 +95,7 @@ impl Default for Config {
             folders: BTreeMap::new(),
             large_upload_bytes: DEFAULT_LARGE_UPLOAD_BYTES,
             path: PathBuf::new(),
+            baseline: None,
         }
     }
 }
@@ -144,12 +154,15 @@ impl Config {
     /// Loads the config, or the defaults when the file does not exist.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let path = path.into();
-        let mut config = match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str::<Self>(&text).map_err(|source| Error::Parse {
-                path: path.clone(),
-                source,
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+        let (mut config, baseline) = match fs::read_to_string(&path) {
+            Ok(text) => {
+                let config = toml::from_str::<Self>(&text).map_err(|source| Error::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+                (config, Some(text))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
             Err(source) => return Err(Error::Io { path, source }),
         };
         // A hand-edited file must not smuggle in an impossible level.
@@ -158,6 +171,7 @@ impl Config {
             return Err(Error::InvalidLevel(format!("in {}", path.display())));
         }
         config.path = path;
+        config.baseline = baseline;
         Ok(config)
     }
 
@@ -177,10 +191,11 @@ impl Config {
         for (folder, &copies) in &other.folders {
             folders.insert(normalize_folder(folder)?, copies);
         }
-        self.default_copies = other.default_copies;
-        self.folders = folders;
-        self.large_upload_bytes = other.large_upload_bytes;
-        self.save()
+        self.changing(|c| {
+            c.default_copies = other.default_copies;
+            c.folders = folders;
+            c.large_upload_bytes = other.large_upload_bytes;
+        })
     }
 
     #[must_use]
@@ -190,8 +205,7 @@ impl Config {
 
     /// Sets the confirmation threshold and saves.
     pub fn set_large_upload_bytes(&mut self, bytes: u64) -> Result<(), Error> {
-        self.large_upload_bytes = bytes;
-        self.save()
+        self.changing(|c| c.large_upload_bytes = bytes)
     }
 
     #[must_use]
@@ -212,28 +226,55 @@ impl Config {
 
     /// Sets the default (`folder` is `None`) or a folder override, and saves.
     pub fn set(&mut self, folder: Option<&str>, copies: u8) -> Result<(), Error> {
-        match folder {
-            None => self.default_copies = copies,
+        let folder = folder.map(normalize_folder).transpose()?;
+        self.changing(|c| match folder {
+            None => c.default_copies = copies,
             Some(f) => {
-                self.folders.insert(normalize_folder(f)?, copies);
+                c.folders.insert(f, copies);
             }
-        }
-        self.save()
+        })
     }
 
     /// Removes a folder override and saves.
     pub fn unset(&mut self, folder: &str) -> Result<(), Error> {
         let key = normalize_folder(folder)?;
-        self.folders.remove(&key).ok_or(Error::NoOverride(key))?;
-        self.save()
+        if !self.folders.contains_key(&key) {
+            return Err(Error::NoOverride(key));
+        }
+        self.changing(|c| {
+            c.folders.remove(&key);
+        })
     }
 
-    fn save(&self) -> Result<(), Error> {
-        let text = toml::to_string_pretty(self)?;
-        crate::fsutil::write_private(&self.path, &text).map_err(|source| Error::Io {
-            path: self.path.clone(),
-            source,
-        })
+    /// Applies `change`, saves, and puts the old values back if saving fails,
+    /// so memory never differs from what is on disk.
+    fn changing(&mut self, change: impl FnOnce(&mut Self)) -> Result<(), Error> {
+        let before = (
+            self.default_copies,
+            self.folders.clone(),
+            self.large_upload_bytes,
+        );
+        change(self);
+        let result = self.save();
+        if result.is_err() {
+            (self.default_copies, self.folders, self.large_upload_bytes) = before;
+        }
+        result
+    }
+
+    fn save(&mut self) -> Result<(), Error> {
+        let text = toml::to_string_pretty(&*self)?;
+        crate::fsutil::write_private_checked(&self.path, self.baseline.as_deref(), &text).map_err(
+            |e| match e {
+                crate::fsutil::WriteError::Changed => Error::Changed(self.path.clone()),
+                crate::fsutil::WriteError::Io(source) => Error::Io {
+                    path: self.path.clone(),
+                    source,
+                },
+            },
+        )?;
+        self.baseline = Some(text);
+        Ok(())
     }
 }
 
@@ -322,5 +363,49 @@ mod tests {
         let old = Config::load(&path).unwrap();
         assert_eq!(old.large_upload_bytes(), 1_000_000_000);
         assert_eq!(old.default_copies(), 2);
+    }
+
+    #[test]
+    fn two_writers_cannot_silently_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut first = Config::load(&path).unwrap();
+        let mut second = Config::load(&path).unwrap();
+
+        first.set(None, 2).unwrap();
+        // `second` still believes the file does not exist.
+        assert!(matches!(second.set(None, 3), Err(Error::Changed(_))));
+        assert_eq!(second.default_copies(), 1, "memory was put back");
+        assert_eq!(
+            Config::load(&path).unwrap().default_copies(),
+            2,
+            "no lost update"
+        );
+
+        // After re-reading, it can go ahead.
+        let mut second = Config::load(&path).unwrap();
+        second.set(None, 3).unwrap();
+        assert_eq!(Config::load(&path).unwrap().default_copies(), 3);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_memory_matching_the_disk() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("cfg");
+        let path = sub.join("config.toml");
+        let mut c = Config::load(&path).unwrap();
+        c.set(Some("Docs"), 2).unwrap();
+
+        // Make the folder read-only so the next save fails.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = c.set(Some("Pics"), 3);
+        let unset = c.unset("Docs");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err() && unset.is_err());
+        assert_eq!(c.copies_for("Pics/x"), 1, "the failed set was undone");
+        assert_eq!(c.copies_for("Docs/x"), 2, "the failed unset was undone");
+        assert_eq!(Config::load(&path).unwrap().copies_for("Docs/x"), 2);
     }
 }

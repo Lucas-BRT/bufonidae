@@ -36,6 +36,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "accounts file {0} was changed by another Bufonidae process while this one was working; \
+         run the command again"
+    )]
+    Changed(PathBuf),
     #[error("accounts file {path} is corrupt: {source}")]
     Parse {
         path: PathBuf,
@@ -76,6 +81,9 @@ struct File {
 pub struct AccountStore {
     path: PathBuf,
     file: File,
+    /// The file's text when last read or written (`None`: it did not exist).
+    /// A save refuses to go on if the file is no longer this.
+    baseline: Option<String>,
 }
 
 impl AccountStore {
@@ -88,17 +96,24 @@ impl AccountStore {
     /// Loads the store, or starts an empty one when the file does not exist.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let path = path.into();
-        let file = match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| Error::Parse {
-                path: path.clone(),
-                source,
-            })?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
+        let (file, baseline) = match fs::read_to_string(&path) {
+            Ok(text) => {
+                let file = toml::from_str(&text).map_err(|source| Error::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+                (file, Some(text))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (File::default(), None),
             Err(source) => {
                 return Err(Error::Io { path, source });
             }
         };
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            baseline,
+        })
     }
 
     #[must_use]
@@ -177,6 +192,7 @@ impl AccountStore {
         let mut staged = AccountStore {
             path: self.path.clone(),
             file: File::default(),
+            baseline: self.baseline.clone(),
         };
         for account in accounts {
             let id_ok = !account.id.is_empty()
@@ -200,6 +216,7 @@ impl AccountStore {
         }
         staged.save()?;
         self.file = staged.file;
+        self.baseline = staged.baseline;
         Ok(())
     }
 
@@ -212,19 +229,29 @@ impl AccountStore {
             .position(|a| a.label == label)
             .ok_or_else(|| Error::NotFound(label.to_owned()))?;
         let account = self.file.accounts.remove(index);
-        self.save()?;
+        if let Err(e) = self.save() {
+            // Memory must keep matching the disk.
+            self.file.accounts.insert(index, account);
+            return Err(e);
+        }
         Ok(account)
     }
 
     /// Writes atomically (temp file + rename) with mode 0600: the file reveals
     /// which accounts the user owns.
-    fn save(&self) -> Result<(), Error> {
-        let io = |source| Error::Io {
-            path: self.path.clone(),
-            source,
-        };
+    fn save(&mut self) -> Result<(), Error> {
         let text = toml::to_string_pretty(&self.file)?;
-        crate::fsutil::write_private(&self.path, &text).map_err(io)
+        crate::fsutil::write_private_checked(&self.path, self.baseline.as_deref(), &text).map_err(
+            |e| match e {
+                crate::fsutil::WriteError::Changed => Error::Changed(self.path.clone()),
+                crate::fsutil::WriteError::Io(source) => Error::Io {
+                    path: self.path.clone(),
+                    source,
+                },
+            },
+        )?;
+        self.baseline = Some(text);
+        Ok(())
     }
 }
 
@@ -324,5 +351,46 @@ mod tests {
         }
         assert!(s.list().len() == 1);
         s.add("other", "ana2@example.com").unwrap();
+    }
+
+    #[test]
+    fn two_writers_cannot_silently_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("accounts.toml");
+        let mut first = AccountStore::load(&path).unwrap();
+        let mut second = AccountStore::load(&path).unwrap();
+
+        first.add("one", "one@example.com").unwrap();
+        // `second` never saw "one"; saving "two" would erase it.
+        assert!(matches!(
+            second.add("two", "two@example.com"),
+            Err(Error::Changed(_))
+        ));
+        assert!(second.list().is_empty(), "memory was put back");
+        let labels: Vec<_> = AccountStore::load(&path)
+            .unwrap()
+            .list()
+            .iter()
+            .map(|a| a.label.clone())
+            .collect();
+        assert_eq!(labels, ["one"], "nothing was lost");
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_account_list_matching_the_disk() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("cfg");
+        let mut s = AccountStore::load(sub.join("accounts.toml")).unwrap();
+        s.add("one", "one@example.com").unwrap();
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+        let added = s.add("two", "two@example.com");
+        let removed = s.remove("one");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(added.is_err() && removed.is_err());
+        let labels: Vec<_> = s.list().iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, ["one"], "memory still equals the disk");
     }
 }
