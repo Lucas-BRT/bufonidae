@@ -76,12 +76,45 @@ Implemented so far: `items(path, size)` and `placements(path, account_id, state)
 - *One process per database file*: the CLI and the desktop app cannot have the index open at the same time. The desktop app will need to own the index and the CLI to refuse (or talk to it) while the app runs. To be solved before MVP-2.
 - *Pinned exactly*, bumped on purpose in its own commit; Dependabot will report newer pre-releases.
 
-## 5. Phases
+## 5. Status and release scope
 
-1. **MVP-0**: workspace, CI, `bufonidae-rclone` (spawn rcd, list/about/copy), CLI `account add/list`, `put <path> --pool X`. Fake backend + planner tests.
-2. **MVP-1**: journal, reconcile, policies, quotas, unified `get`/`ls`, `mirror` redundancy, stable CLI.
-3. **MVP-2**: gpui desktop (accounts, pools, drag & drop, queue, account health).
-4. **Phase 3**: `parity`, chunking, watch folder, packaging, website.
+### First-release guarantees (the contract)
+
+- Bufonidae is a **logical directory over several accounts**, not a mounted filesystem and not a two-way sync. It stores, lists, downloads, and repairs; it does not watch folders.
+- **Mirroring protects against losing an account**, not against Mega itself failing for everyone, and it is not a backup.
+- "Every copy fits" is checked **before** a store starts. A runtime failure can still leave a file with fewer copies than wanted; `repair` completes it.
+- Existing files are **never silently overwritten**: `get` never replaces a local file; `put` leaves a remote file in place and says so.
+- Only regular files are stored. Symbolic links, special files and non-UTF-8 names are skipped and reported. Empty folders are not stored.
+- Integrity today is **size only**. Content hashes (BLAKE3) are planned, not implemented. A same-size difference is not detected yet.
+- The local index is **not disposable**: it holds redundancy intent and (later) hashes that a remote listing cannot recreate. Export and backup are release tasks.
+
+### Status
+
+| Area | State |
+|---|---|
+| Core: placement, mirror:N, put/get/ls, reconcile, repair, config | Done, covered by fake-remote tests; verified live against one real Mega account (login, upload, cancel) |
+| CLI | Done for the commands above; no large-upload confirmation yet |
+| Desktop | Files (folders), Accounts, Settings, add account, browser, store, download, cancel |
+| Integrity (hashes), durable jobs, account health, rename/delete | Not done |
+| Website, packaging, release workflow, user docs | Not done |
+
+### Release milestones
+
+Ordered work, with the hardening findings that came out of an independent review of this repository. Details of each task are tracked in the commits and in `docs/RELEASING.md`.
+
+0. **Release contract and docs** (this section, README, `docs/COMPATIBILITY.md`, `docs/RELEASING.md`, exact dependency pins).
+1. **Trustworthy metadata**: transactional index, reconcile that preserves ambiguity (no lossy path maps, narrow "not found" handling, duplicate accounts rejected), portable export and a Turso exit strategy, safe local-state writes.
+2. **Correct transfers**: enforce the rclone version, one long-lived daemon, upload integrity and collision prevention, download to a temporary file then publish, durable jobs and crash recovery.
+3. **Security review.**
+4. **Finish the desktop**: account health and lifecycle, reconcile/repair UI, redundancy settings, selection and bulk download, error states, accessibility.
+5. **Rename and delete** in the pool, with tombstones.
+6. **Qualification**: automated coverage plus a manual live-Mega checklist; private beta.
+7. **Website** (Topcoat, SSR, Docker + compose).
+8. **Releases**: `.deb`, AppImage and tarballs first (Flatpak later), signed, with the tested rclone bundled; public launch.
+
+### Deferred beyond the first release
+
+`parity` (erasure coding), chunking of huge files, watch folders, mounting, automatic rebalancing, named pools, other providers, automatic duplicate cleanup, desktop/CLI IPC, full translations, ARM64, Flatpak.
 
 ## 6. Dependencies
 
@@ -93,12 +126,12 @@ Implemented so far: `items(path, size)` and `placements(path, account_id, state)
 - `serde`, `serde_json`, `toml` — protocol and config
 - `turso` (pinned exactly, pre-release) — index/journal
 - `thiserror` (libs), `anyhow` (binaries only)
-- `tracing`, `tracing-subscriber` — logging
+- `tracing`, `tracing-subscriber` — logging (not used yet)
 - `clap` (derive) — CLI
 - `directories` — XDG paths
 - `keyring` or `oo7` — secrets
-- `blake3` — local hashing
-- `notify` — watch folder (phase 3)
+- `blake3` — local hashing (planned, not added yet)
+- `notify` — watch folder (deferred)
 - `uuid`, `bytesize`, `humantime`
 - dev: `tempfile`, `proptest` (planner), `insta` (snapshots), `wiremock`/`axum` fake rcd, `assert_cmd`
 
@@ -144,6 +177,9 @@ Private `Lucas-BRT/bufonidae` on GitHub, default branch `main`, MIT `LICENSE`, R
 
 - rclone is the only transfer engine; rsync is out of scope.
 - Default placement granularity: per file.
+- Direct dependencies are pinned exactly (`=x.y.z`) and `Cargo.lock` is committed; Dependabot proposes bumps, each made on purpose in its own commit.
+- The Linux file dialog offers files or folders, never both, so the app has its own browser.
+- Flatpak is deferred; `.deb`, AppImage and tarballs ship first, with the tested rclone bundled privately.
 
 ## 11. Open questions
 
