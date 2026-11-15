@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use bufonidae_core::account::AccountStore;
+use bufonidae_core::index::Index;
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
 use bufonidae_core::put;
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
             if chosen.is_empty() {
                 bail!("no accounts connected; run `bufonidae account add` first");
             }
+            let index = Index::open(&Index::default_path()?).await?;
             let rcd = Rcd::start("rclone")
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
@@ -92,7 +94,15 @@ async fn main() -> Result<()> {
                     }
                 }
                 Ok::<_, anyhow::Error>(
-                    put::put(&rcd, &chosen, &MostFreeSpace::default(), &paths, &to).await?,
+                    put::put(
+                        &rcd,
+                        &index,
+                        &chosen,
+                        &MostFreeSpace::default(),
+                        &paths,
+                        &to,
+                    )
+                    .await?,
                 )
             }
             .await;

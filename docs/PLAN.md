@@ -23,7 +23,7 @@ bufonidae/                      (Cargo workspace, edition 2024, pinned toolchain
 
 Rule: core depends on neither gpui nor clap. CLI and desktop stay thin; all testable logic lives in core.
 
-Flow: `drop` (GUI/CLI/watch folder) → **planner** (core) picks a destination account per item → **journal** (SQLite) records the intent → `rclone rcd` executes (`operations/copyfile`, `sync/copy`) → verification → journal confirms → index updates.
+Flow: `drop` (GUI/CLI/watch folder) → **planner** (core) picks a destination account per item → **journal** (Turso) records the intent → `rclone rcd` executes (`operations/copyfile`, `sync/copy`) → verification → journal confirms → index updates.
 
 ## 2. Problems and solutions
 
@@ -41,7 +41,7 @@ Flow: `drop` (GUI/CLI/watch folder) → **planner** (core) picks a destination a
 | 10 | **Mega allows duplicate names** in the same folder. | The planner never creates duplicates; reconcile flags them (`rclone dedupe` only with confirmation). |
 | 11 | **Rate limits / logins** (many simultaneous logins → errors, temporary blocks). | A single `rcd` instance manages all N accounts; sessions are reused; per-account and global concurrency semaphores; exponential backoff with jitter. |
 | 12 | **Credentials**: `rclone.conf` only obscures passwords (obscure ≠ encryption). | Secrets in the Secret Service (GNOME Keyring/KWallet) via `keyring`/`oo7`. The rclone config is generated at runtime (0600 temp file in `XDG_RUNTIME_DIR`, or `config/create` over RC) and never persisted with passwords. 2FA: confirm support in the pinned rclone and expose a field in the UI. |
-| 13 | **Metadata privacy**: the local index reveals folder structure. | SQLite in `XDG_DATA_HOME`, mode 0600; SQLCipher out of MVP scope. Mega is already E2EE; optional `crypt` on top is out of the MVP. |
+| 13 | **Metadata privacy**: the local index reveals folder structure. | Turso database in `XDG_DATA_HOME`, mode 0600; at-rest encryption out of MVP scope (Turso's is experimental). Mega is already E2EE; optional `crypt` on top is out of the MVP. |
 | 14 | **External binary dependency** (rclone missing/wrong version). | Detect at startup (`rclone version`), pinned minimum version, actionable error. Not bundled in the MVP; packaging (AppImage/Flatpak) may include it. |
 | 15 | **Orphaned `rcd` process / exposed port.** | Start with `--rc-addr 127.0.0.1:0` (ephemeral port) + random per-session `--rc-user/--rc-pass`; supervisor kills it on drop; `kill_on_drop`. |
 | 16 | **gpui is unstable** (API changes without strict semver; ecosystem in flux). | Exact pin (zed git rev or crates.io version; confirm what is published at scaffold time). Thin view layer isolated in `apps/desktop`; gpui upgrades get their own commit. `gpui-component` for widgets (table, tree, input). |
@@ -60,12 +60,19 @@ Configured per pool, overridable per folder:
 
 The planner picks N distinct accounts per item; reads choose the healthiest copy (quota, errors); a degraded pool (account down) is shown in the UI with a repair action.
 
-## 4. Data model (SQLite, `rusqlite` bundled)
+## 4. Data model (Turso, embedded)
 
 - `account(id, label, remote_name, quota_total, quota_used, bw_window…, enabled)`
 - `item(id, virtual_path, size, blake3, kind)`; `placement(item_id, account_id, remote_path, state)`
 - `journal(id, op, payload, state, ts)` — write-ahead
 - Virtual directory = set of accounts + policy; "3 accounts in the same directory" = one *pool*.
+
+Implemented so far: `items(path, size)` and `placements(path, account_id, state)`, where `state` is `pending` (written before the upload, i.e. the write-ahead journal) or `done`.
+
+**Why Turso, and what it costs** (decided by the project owner): it is a beta, pre-release Rust rewrite of SQLite (`turso` 0.9.0-pre.5). Consequences handled in the design:
+- *Beta/data safety*: the index is a cache and the remote listing is the source of truth, so a corrupted index is rebuilt with `reconcile`, not lost data.
+- *One process per database file*: the CLI and the desktop app cannot have the index open at the same time. The desktop app will need to own the index and the CLI to refuse (or talk to it) while the app runs. To be solved before MVP-2.
+- *Pinned exactly*, bumped on purpose in its own commit; Dependabot will report newer pre-releases.
 
 ## 5. Phases
 
@@ -82,7 +89,7 @@ The planner picks N distinct accounts per item; reads choose the healthiest copy
 - `tokio` (rt, process, sync, time) — async, rcd supervisor
 - `reqwest` (rustls, json; no openssl) — RC client
 - `serde`, `serde_json`, `toml` — protocol and config
-- `rusqlite` (bundled) — index/journal
+- `turso` (pinned exactly, pre-release) — index/journal
 - `thiserror` (libs), `anyhow` (binaries only)
 - `tracing`, `tracing-subscriber` — logging
 - `clap` (derive) — CLI

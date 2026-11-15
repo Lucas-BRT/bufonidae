@@ -9,6 +9,7 @@ use std::time::SystemTime;
 use bufonidae_rclone::rcd::Rcd;
 
 use crate::account::Account;
+use crate::index::{self, Index};
 use crate::placement::{AccountId, AccountSpace, Placement, plan_batch};
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +24,8 @@ pub enum Error {
     },
     #[error("remote: {0}")]
     Remote(String),
+    #[error(transparent)]
+    Index(#[from] index::Error),
 }
 
 /// What `put` needs from a storage account. Implemented over `rclone rcd` for
@@ -229,6 +232,7 @@ fn changed_since_scan(file: &LocalFile) -> bool {
 /// Copies `sources` into `dest` on the given `accounts`.
 pub async fn put<R: RemoteFs>(
     remote: &R,
+    index: &Index,
     accounts: &[Account],
     policy: &impl Placement,
     sources: &[PathBuf],
@@ -268,11 +272,11 @@ pub async fn put<R: RemoteFs>(
     let plan = plan_batch(policy, &spaces, &sizes);
 
     for (file, chosen) in todo.iter().zip(plan) {
-        let Some(AccountId(index)) = chosen else {
+        let Some(AccountId(slot)) = chosen else {
             report.no_room.push(file.rel.clone());
             continue;
         };
-        let account = &accounts[index as usize];
+        let account = &accounts[slot as usize];
         if changed_since_scan(file) {
             report
                 .failed
@@ -288,13 +292,20 @@ pub async fn put<R: RemoteFs>(
                 .push((file.rel.clone(), "unusable path".into()));
             continue;
         };
-        match remote
-            .upload(account, parent, name, &join(&dest, &file.rel))
-            .await
-        {
-            Ok(()) => report
-                .uploaded
-                .push((file.rel.clone(), account.label.clone(), file.size)),
+        let remote_path = join(&dest, &file.rel);
+        // Write-ahead: a crash after this line leaves a `pending` trace.
+        index
+            .mark_pending(&remote_path, file.size, &account.id)
+            .await?;
+        match remote.upload(account, parent, name, &remote_path).await {
+            Ok(()) => {
+                index.mark_done(&remote_path, &account.id).await?;
+                report
+                    .uploaded
+                    .push((file.rel.clone(), account.label.clone(), file.size));
+            }
+            // Left `pending` on purpose: a failed upload may have left a
+            // partial file for `reconcile` to find.
             Err(e) => report.failed.push((file.rel.clone(), e.to_string())),
         }
     }
@@ -309,6 +320,7 @@ mod tests {
     use std::collections::HashMap;
 
     struct Fake {
+        fail_uploads: bool,
         free: HashMap<String, u64>,
         existing: HashMap<String, HashSet<String>>,
         uploads: RefCell<Vec<(String, String)>>,
@@ -322,6 +334,9 @@ mod tests {
             Ok(self.existing.get(&a.label).cloned().unwrap_or_default())
         }
         async fn upload(&self, a: &Account, _: &Path, _: &str, to: &str) -> Result<(), Error> {
+            if self.fail_uploads {
+                return Err(Error::Remote("boom".into()));
+            }
             self.uploads
                 .borrow_mut()
                 .push((a.label.clone(), to.to_owned()));
@@ -339,6 +354,7 @@ mod tests {
 
     fn fake(free: &[(&str, u64)]) -> Fake {
         Fake {
+            fail_uploads: false,
             free: free.iter().map(|(l, f)| ((*l).to_owned(), *f)).collect(),
             existing: HashMap::new(),
             uploads: RefCell::default(),
@@ -377,8 +393,10 @@ mod tests {
     async fn spreads_files_across_accounts() {
         let dir = tree();
         let remote = fake(&[("one", 100), ("two", 100)]);
+        let index = Index::open_memory().await.unwrap();
         let report = put(
             &remote,
+            &index,
             &[account("one"), account("two")],
             &MostFreeSpace::default(),
             &[dir.path().join("photos")],
@@ -388,6 +406,9 @@ mod tests {
         .unwrap();
         assert!(report.is_complete());
         assert_eq!(report.uploaded.len(), 2);
+        let indexed = index.list("Pics/").await.unwrap();
+        assert_eq!(indexed.len(), 2);
+        assert!(index.pending().await.unwrap().is_empty());
         let uploads = remote.uploads.borrow();
         assert_ne!(uploads[0].0, uploads[1].0, "one file per account");
         assert!(uploads.iter().any(|(_, to)| to == "Pics/photos/sub/b.bin"));
@@ -400,8 +421,10 @@ mod tests {
         remote
             .existing
             .insert("two".into(), HashSet::from(["photos/sub/b.bin".to_owned()]));
+        let index = Index::open_memory().await.unwrap();
         let report = put(
             &remote,
+            &index,
             &[account("one"), account("two")],
             &MostFreeSpace::default(),
             &[dir.path().join("photos")],
@@ -419,8 +442,10 @@ mod tests {
     async fn unknown_free_space_is_an_error() {
         let dir = tree();
         let remote = fake(&[]);
+        let index = Index::open_memory().await.unwrap();
         let result = put(
             &remote,
+            &index,
             &[account("one")],
             &MostFreeSpace::default(),
             &[dir.path().join("photos")],
@@ -428,5 +453,26 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(Error::Remote(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_upload_stays_pending_in_the_index() {
+        let dir = tree();
+        let mut remote = fake(&[("one", 1000)]);
+        remote.fail_uploads = true;
+        let index = Index::open_memory().await.unwrap();
+        let report = put(
+            &remote,
+            &index,
+            &[account("one")],
+            &MostFreeSpace::default(),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.failed.len(), 2);
+        assert!(index.list("").await.unwrap().is_empty());
+        assert_eq!(index.pending().await.unwrap().len(), 2);
     }
 }
