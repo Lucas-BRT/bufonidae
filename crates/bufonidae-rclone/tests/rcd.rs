@@ -111,3 +111,16 @@ async fn config_errors_never_echo_the_request() {
     assert!(!err.to_string().contains("secret123"), "{err}");
     rcd.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_missing_folder_is_recognised_but_a_missing_remote_is_not() {
+    let Some(rcd) = start().await else { return };
+    let dir = tempfile::tempdir().unwrap();
+
+    let missing = rcd.list(&local(&dir), "no-such-folder").await.unwrap_err();
+    assert!(missing.is_directory_not_found(), "{missing}");
+
+    let no_remote = rcd.list("acct-undefined:", "").await.unwrap_err();
+    assert!(!no_remote.is_directory_not_found(), "{no_remote}");
+    rcd.shutdown().await.unwrap();
+}

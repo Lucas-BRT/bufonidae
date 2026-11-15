@@ -17,6 +17,11 @@ pub enum Error {
     InvalidLabel(String),
     #[error("an account labelled {0:?} already exists")]
     DuplicateLabel(String),
+    #[error(
+        "{email} is already connected as {label:?}; connecting it twice would make two copies \
+         look like they are on different accounts"
+    )]
+    DuplicateAccount { email: String, label: String },
     #[error("no account labelled {0:?}")]
     NotFound(String),
     #[error("could not determine the configuration directory")]
@@ -110,6 +115,7 @@ impl AccountStore {
         if self.find(label).is_some() {
             return Err(Error::DuplicateLabel(label.to_owned()));
         }
+        self.check_new_identity(email)?;
         Ok(Account {
             id: uuid::Uuid::new_v4().simple().to_string(),
             label: label.to_owned(),
@@ -117,11 +123,32 @@ impl AccountStore {
         })
     }
 
+    /// The same Mega account under two labels is refused: mirroring counts
+    /// copies on distinct accounts, so a second label for one account would
+    /// make a single point of failure look redundant. E-mails are compared
+    /// ignoring case and surrounding spaces.
+    fn check_new_identity(&self, email: &str) -> Result<(), Error> {
+        let wanted = email.trim().to_lowercase();
+        match self
+            .file
+            .accounts
+            .iter()
+            .find(|a| a.email.trim().to_lowercase() == wanted)
+        {
+            Some(existing) => Err(Error::DuplicateAccount {
+                email: email.trim().to_owned(),
+                label: existing.label.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Stores an account returned by [`prepare`](Self::prepare) and saves.
     pub fn commit(&mut self, account: Account) -> Result<(), Error> {
         if self.find(&account.label).is_some() {
             return Err(Error::DuplicateLabel(account.label));
         }
+        self.check_new_identity(&account.email)?;
         self.file.accounts.push(account);
         if let Err(e) = self.save() {
             self.file.accounts.pop();
@@ -243,5 +270,20 @@ mod tests {
             AccountStore::load(&path),
             Err(Error::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn the_same_mega_account_cannot_be_connected_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(&dir);
+        s.add("work", "Ana@Example.com").unwrap();
+        for dup in ["ana@example.com", " ANA@EXAMPLE.COM ", "Ana@Example.com"] {
+            assert!(
+                matches!(s.add("other", dup), Err(Error::DuplicateAccount { .. })),
+                "{dup}"
+            );
+        }
+        assert!(s.list().len() == 1);
+        s.add("other", "ana2@example.com").unwrap();
     }
 }

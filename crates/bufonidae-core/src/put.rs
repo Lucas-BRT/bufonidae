@@ -27,6 +27,8 @@ pub enum Error {
     Remote(String),
     #[error(transparent)]
     Index(#[from] index::Error),
+    #[error("account {0:?} was given twice; each copy must go to a different account")]
+    DuplicateAccount(String),
 }
 
 /// What `put` needs from a storage account. Implemented over `rclone rcd` for
@@ -83,10 +85,10 @@ impl RemoteFs for Rcd {
                 .into_iter()
                 .map(|e| (e.path, u64::try_from(e.size).unwrap_or(0)))
                 .collect()),
-            // The folder does not exist yet on this account.
-            Err(bufonidae_rclone::Error::Rpc { message, .. }) if message.contains("not found") => {
-                Ok(HashMap::new())
-            }
+            // The folder does not exist yet on this account. Only rclone's own
+            // "directory not found" answer counts: any other failure must stay
+            // an error, or a reconcile would read it as "everything is gone".
+            Err(e) if e.is_directory_not_found() => Ok(HashMap::new()),
             Err(e) => Err(Error::Remote(e.to_string())),
         }
     }
@@ -316,6 +318,14 @@ pub async fn put_observed<R: RemoteFs>(
     observer: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Report, Error> {
     let dest = normalize_dest(dest)?;
+    // The same account twice would let two "different" copies share one
+    // account, defeating mirroring.
+    let mut seen = HashSet::new();
+    for account in accounts {
+        if !seen.insert(account.id.as_str()) {
+            return Err(Error::DuplicateAccount(account.label.clone()));
+        }
+    }
     let scan = scan(sources)?;
     let mut report = Report {
         skipped: scan.skipped,
@@ -705,5 +715,24 @@ mod tests {
             .count();
         assert_eq!(copied, 4);
         assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_same_account_listed_twice_is_refused() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let result = put(
+            &remote,
+            &index,
+            &[account("one"), account("one")],
+            &MostFreeSpace::default(),
+            &mirror(2),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await;
+        assert!(matches!(result, Err(Error::DuplicateAccount(_))));
+        assert!(remote.uploads.borrow().is_empty());
     }
 }

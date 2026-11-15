@@ -43,6 +43,19 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// `true` only for rclone's "that directory does not exist" answer
+    /// (HTTP 404, `directory not found`). Anything else, including a missing
+    /// remote or a login failure, is a real error and never an empty folder.
+    #[must_use]
+    pub fn is_directory_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Rpc { status: 404, message, .. } if message.ends_with("directory not found")
+        )
+    }
+}
+
 /// Parses the first line of `rclone version`, e.g. `rclone v1.68.2`.
 pub fn parse_version(output: &str) -> Result<Version, Error> {
     let bad = || Error::UnparsableVersion(output.lines().next().unwrap_or_default().to_owned());
@@ -86,5 +99,26 @@ mod tests {
         assert!(parse_version("command not found").is_err());
         assert!(parse_version("").is_err());
         assert!(parse_version("rclone v1.2\n").is_err());
+    }
+
+    fn rpc(status: u16, message: &str) -> Error {
+        Error::Rpc {
+            method: "operations/list".into(),
+            status,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn only_a_real_directory_not_found_counts_as_one() {
+        assert!(rpc(404, "error in ListJSON: directory not found").is_directory_not_found());
+        // Same words from a different failure, or the wrong status, must not.
+        assert!(!rpc(500, "error in ListJSON: directory not found").is_directory_not_found());
+        assert!(!rpc(404, "object not found").is_directory_not_found());
+        assert!(
+            !rpc(500, "didn't find section in config file (\"acct-x\")").is_directory_not_found()
+        );
+        assert!(!rpc(500, "couldn't login: not found").is_directory_not_found());
+        assert!(!Error::Startup("directory not found".into()).is_directory_not_found());
     }
 }
