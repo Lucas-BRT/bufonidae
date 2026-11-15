@@ -1,4 +1,5 @@
 mod accounts;
+mod add_account;
 mod app;
 mod backend;
 mod files;

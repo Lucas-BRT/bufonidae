@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, div, px,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _,
@@ -11,6 +12,7 @@ use gpui_component::{
     sidebar::{Sidebar, SidebarFooter, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
 };
 
+use crate::add_account::{AddAccountForm, FormEvent};
 use crate::backend::{Backend, Snapshot, StartupError};
 use crate::format;
 use crate::theme;
@@ -31,6 +33,8 @@ pub struct BufonidaeApp {
     backend: Result<Arc<Backend>, StartupError>,
     screen: Screen,
     data: Data,
+    /// The open "Add account" modal, if any.
+    modal: Option<Entity<AddAccountForm>>,
 }
 
 impl BufonidaeApp {
@@ -47,6 +51,7 @@ impl BufonidaeApp {
             backend,
             screen: Screen::Files,
             data: Data::Loading,
+            modal: None,
         };
         app.reload(cx);
         app
@@ -57,6 +62,28 @@ impl BufonidaeApp {
             Data::Ready(snapshot) => Some(snapshot),
             _ => None,
         }
+    }
+
+    /// Opens the "Add account" modal.
+    pub(crate) fn open_add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if self.modal.is_some() {
+            return;
+        }
+        let backend = Arc::clone(backend);
+        let form = cx.new(|cx| AddAccountForm::new(backend, window, cx));
+        cx.subscribe(&form, |this, _form, event: &FormEvent, cx| {
+            this.modal = None;
+            if matches!(event, FormEvent::Added) {
+                this.reload(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        self.modal = Some(form);
+        cx.notify();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -130,7 +157,7 @@ impl BufonidaeApp {
             .into_any_element(),
             Data::Ready(_) => match self.screen {
                 Screen::Files => self.files_screen(window, cx).into_any_element(),
-                Screen::Accounts => self.accounts_screen(cx).into_any_element(),
+                Screen::Accounts => self.accounts_screen(window, cx).into_any_element(),
             },
         }
     }
@@ -165,16 +192,39 @@ impl Render for BufonidaeApp {
                 .into_any_element();
         }
 
-        base.h_flex()
-            .child(self.sidebar(cx))
+        let overlay = self.modal.clone().map(|form| {
+            // A scrim over the whole window with the form centred on it.
+            // Escape closes the form unless a sign-in is running.
+            div()
+                .id("modal")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().overlay)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && let Some(form) = &this.modal
+                    {
+                        form.update(cx, |form, cx| form.cancel(cx));
+                    }
+                }))
+                .child(form)
+        });
+
+        base.relative()
             .child(
-                div()
-                    .v_flex()
-                    .flex_1()
-                    .h_full()
-                    .min_w(px(0.0))
-                    .child(self.body(window, cx)),
+                div().size_full().h_flex().child(self.sidebar(cx)).child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(0.0))
+                        .child(self.body(window, cx)),
+                ),
             )
+            .children(overlay)
             .into_any_element()
     }
 }
