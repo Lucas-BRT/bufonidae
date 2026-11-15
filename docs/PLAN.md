@@ -92,25 +92,28 @@ Implemented so far: `items(path, size)` and `placements(path, account_id, state)
 
 | Area | State |
 |---|---|
-| Core: placement, mirror:N, put/get/ls, reconcile, repair, config | Done, covered by fake-remote tests; verified live against one real Mega account (login, upload, cancel) |
-| CLI | Done for the commands above; no large-upload confirmation yet |
-| Desktop | Files (folders), Accounts, Settings, add account, browser, store, download, cancel |
-| Integrity (hashes), durable jobs, account health, rename/delete | Not done |
-| Website, packaging, release workflow, user docs | Not done |
+| Core: placement, mirror:N, put/get/ls, reconcile, repair, config | Done and tested with fake remotes; used against one real Mega account (login, upload, download, cancel) |
+| Integrity | BLAKE3 recorded at store time and checked on every download and rebuilt copy; staged, verified, never-overwriting downloads; collisions and "different file already there" refused; a file edited mid-upload is not marked done |
+| Metadata | Transactional index (schema v3), lost files remembered, reconcile quarantines ambiguity (duplicate names, disagreeing sizes), portable export/import, atomic private writes with lost-update detection |
+| Resilience | One account that cannot sign in or does not answer is set aside and reported; the rest carry on |
+| Security | rclone version enforced; daemon environment scrubbed, no proxy or redirects; central path validator; terminal-safe output; `SECURITY.md` |
+| CLI | `account` (add, list, reauth, remove), `put`, `ls`, `get`, `reconcile`, `repair`, `redundancy`, `export`, `import` |
+| Desktop | Files (folders, download, drop, cancel), Accounts (space, sign in again, remove), Check (reconcile and repair), Settings (copies, large-upload limit), unfinished-upload notice |
+| Website | Four pages, facts read from the product, static container image checked running read-only |
+| Packaging | Tarball and `.deb` with the tested rclone inside, reproducible; release workflow makes a **draft** pre-release |
 
-### Release milestones
+### What is left
 
-Ordered work, with the hardening findings that came out of an independent review of this repository. Details of each task are tracked in the commits and in `docs/RELEASING.md`.
+Honest list, most important first. Nothing here is hidden by the status above.
 
-0. **Release contract and docs** (this section, README, `docs/COMPATIBILITY.md`, `docs/RELEASING.md`, exact dependency pins).
-1. **Trustworthy metadata**: transactional index, reconcile that preserves ambiguity (no lossy path maps, narrow "not found" handling, duplicate accounts rejected), portable export and a Turso exit strategy, safe local-state writes.
-2. **Correct transfers**: enforce the rclone version, one long-lived daemon, upload integrity and collision prevention, download to a temporary file then publish, durable jobs and crash recovery.
-3. **Security review.**
-4. **Finish the desktop**: account health and lifecycle, reconcile/repair UI, redundancy settings, selection and bulk download, error states, accessibility.
-5. **Rename and delete** in the pool, with tombstones.
-6. **Qualification**: automated coverage plus a manual live-Mega checklist; private beta.
-7. **Website** (Topcoat, SSR, Docker + compose).
-8. **Releases**: `.deb`, AppImage and tarballs first (Flatpak later), signed, with the tested rclone bundled; public launch.
+1. **Live qualification** (`docs/QUALIFICATION.md`): the checklist exists and has not been run. Only login, upload, download and cancel were tried on a real account; everything else is tested with fakes.
+2. **Release pipeline**: exercised by hand-dispatch only (see `docs/RELEASING.md`); a real tag has never been pushed, nothing has been published, and `.deb` installation on a clean machine is untested.
+3. **A durable job queue and one long-lived rclone** (each operation still starts its own rclone and signs in again). A crash mid-store is recovered by Check, not resumed.
+4. **Rename and delete** inside the pool (they need an item identity separate from its path, and a journal for the operation).
+5. **Desktop gaps**: selecting several files to download at once, keyboard navigation and screen-reader support (unverified in the pinned gpui), first-run onboarding, translations.
+6. **Security gaps**: secrets are not zeroized; the keyring's locked, denied and missing cases are not tested; no structured log.
+7. **Packaging gaps**: no AppImage (not testable here), no Flatpak (the sandbox needs the file browser and keyring access adapted), x86_64 and glibc 2.39 or newer only, no signatures beyond SHA-256 (and attestation on a public repository).
+8. **Turso is a beta database.** Export/import is the way out; an importer into another database is not built.
 
 ### Deferred beyond the first release
 

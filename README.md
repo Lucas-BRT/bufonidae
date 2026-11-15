@@ -56,6 +56,13 @@ bufonidae repair [--prefix <folder>]
 bufonidae redundancy show | set <single|mirror|mirror:N> [--folder <f>] | unset <f>
 ```
 
+## More
+
+- [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md): the live-Mega checklist (not run yet).
+- [`docs/RECOVERY.md`](docs/RECOVERY.md), [`SECURITY.md`](SECURITY.md),
+  [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md), [`docs/RELEASING.md`](docs/RELEASING.md),
+  [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Mega terms of service
 
 Bufonidae only connects accounts you already own. It does not create accounts
