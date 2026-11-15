@@ -33,7 +33,7 @@ impl Report {
 }
 
 /// `true` when `path` is `prefix` itself or lives under it.
-fn is_under(path: &str, prefix: &str) -> bool {
+pub(crate) fn is_under(path: &str, prefix: &str) -> bool {
     prefix.is_empty()
         || path == prefix
         || path
@@ -152,12 +152,12 @@ mod tests {
         async fn free_space(&self, _: &Account) -> Result<Option<u64>, RemoteError> {
             Ok(None)
         }
-        async fn existing_files(
+        async fn list_files(
             &self,
             _: &Account,
             _: &str,
-        ) -> Result<HashSet<String>, RemoteError> {
-            Ok(HashSet::new())
+        ) -> Result<HashMap<String, u64>, RemoteError> {
+            Ok(HashMap::new())
         }
         async fn upload(&self, _: &Account, _: &Path, _: &str, _: &str) -> Result<(), RemoteError> {
             Err(RemoteError::Remote("not used by get".into()))

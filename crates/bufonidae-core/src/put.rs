@@ -1,7 +1,7 @@
 //! `put`: copy local files and folders into a pool of accounts, one file at a
 //! time, each file on the account the placement policy picks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -33,12 +33,14 @@ pub enum Error {
 pub trait RemoteFs {
     /// Free bytes of the account, `None` when the backend does not say.
     fn free_space(&self, account: &Account) -> impl Future<Output = Result<Option<u64>, Error>>;
-    /// Paths (relative to `dir`) of every file already under `dir`.
-    fn existing_files(
+    /// Every file under `dir` as `(path relative to dir, size in bytes)`. A
+    /// folder that does not exist yet is an empty listing; any other failure
+    /// is an error, never an empty listing.
+    fn list_files(
         &self,
         account: &Account,
         dir: &str,
-    ) -> impl Future<Output = Result<HashSet<String>, Error>>;
+    ) -> impl Future<Output = Result<HashMap<String, u64>, Error>>;
     /// Copies `remote_path` from the account to `dest_dir/dest_rel` on the
     /// local disk.
     fn download(
@@ -67,15 +69,22 @@ impl RemoteFs for Rcd {
         Ok(about.free)
     }
 
-    async fn existing_files(&self, account: &Account, dir: &str) -> Result<HashSet<String>, Error> {
+    async fn list_files(
+        &self,
+        account: &Account,
+        dir: &str,
+    ) -> Result<HashMap<String, u64>, Error> {
         match self
             .list_files_recursive(&format!("{}:", account.remote_name()), dir)
             .await
         {
-            Ok(entries) => Ok(entries.into_iter().map(|e| e.path).collect()),
-            // The destination folder does not exist yet on this account.
+            Ok(entries) => Ok(entries
+                .into_iter()
+                .map(|e| (e.path, u64::try_from(e.size).unwrap_or(0)))
+                .collect()),
+            // The folder does not exist yet on this account.
             Err(bufonidae_rclone::Error::Rpc { message, .. }) if message.contains("not found") => {
-                Ok(HashSet::new())
+                Ok(HashMap::new())
             }
             Err(e) => Err(Error::Remote(e.to_string())),
         }
@@ -275,7 +284,7 @@ pub async fn put<R: RemoteFs>(
     let mut present = HashSet::new();
     let mut spaces = Vec::new();
     for (i, account) in accounts.iter().enumerate() {
-        present.extend(remote.existing_files(account, &dest).await?);
+        present.extend(remote.list_files(account, &dest).await?.into_keys());
         let free = remote.free_space(account).await?.ok_or_else(|| {
             Error::Remote(format!(
                 "account {:?} does not report its free space",
@@ -356,8 +365,14 @@ mod tests {
         async fn free_space(&self, a: &Account) -> Result<Option<u64>, Error> {
             Ok(self.free.get(&a.label).copied())
         }
-        async fn existing_files(&self, a: &Account, _: &str) -> Result<HashSet<String>, Error> {
-            Ok(self.existing.get(&a.label).cloned().unwrap_or_default())
+        async fn list_files(&self, a: &Account, _: &str) -> Result<HashMap<String, u64>, Error> {
+            Ok(self
+                .existing
+                .get(&a.label)
+                .into_iter()
+                .flatten()
+                .map(|p| (p.clone(), 0))
+                .collect())
         }
         async fn download(&self, _: &Account, _: &str, _: &Path, _: &str) -> Result<(), Error> {
             Err(Error::Remote("not used by put".into()))

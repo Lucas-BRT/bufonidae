@@ -7,6 +7,7 @@ use bufonidae_core::index::Index;
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
 use bufonidae_core::put;
+use bufonidae_core::reconcile;
 use bufonidae_core::secrets::KeyringStore;
 use bufonidae_rclone::rcd::Rcd;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,16 @@ enum Command {
         #[arg(long, default_value = ".")]
         out: std::path::PathBuf,
     },
+    /// Compare the index with what the accounts really hold. Dry run unless
+    /// `--apply`; only the local index is ever changed.
+    Reconcile {
+        /// Only this folder (default: everything on the accounts).
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Write the fixes to the index.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Manage connected Mega accounts.
     #[command(subcommand)]
     Account(AccountCommand),
@@ -77,6 +88,33 @@ async fn main() -> Result<()> {
     let secrets: SharedSecrets = Arc::new(KeyringStore);
 
     match cli.command {
+        Command::Reconcile { prefix, apply } => {
+            let index = Index::open(&Index::default_path()?).await?;
+            let accounts = store.list().to_vec();
+            if accounts.is_empty() {
+                bail!("no accounts connected; run `bufonidae account add` first");
+            }
+            let rcd = Rcd::start("rclone")
+                .await
+                .context("could not start rclone; is it installed and on PATH?")?;
+            let result = async {
+                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
+                    if let Err(e) = result {
+                        eprintln!("warning: account {:?}: {e}", account.label);
+                    }
+                }
+                Ok::<_, anyhow::Error>(
+                    reconcile::reconcile(&rcd, &index, &accounts, &prefix, apply).await?,
+                )
+            }
+            .await;
+            rcd.shutdown().await?;
+            let report = result?;
+            print_reconcile(&report);
+            if report.unresolved() > 0 || (!apply && report.fixable() > 0) {
+                std::process::exit(1);
+            }
+        }
         Command::Ls { prefix } => {
             let index = Index::open(&Index::default_path()?).await?;
             let prefix = prefix.trim_matches('/');
@@ -231,5 +269,50 @@ fn print_report(report: &put::Report) {
     }
     for (rel, reason) in &report.failed {
         eprintln!("FAILED    {rel}: {reason}");
+    }
+}
+
+fn print_reconcile(r: &reconcile::Report) {
+    let verb =
+        |applied: bool, done: &'static str, would: &'static str| if applied { done } else { would };
+    println!("consistent  {}", r.consistent);
+    for (p, a) in &r.confirmed {
+        println!(
+            "{}  {p}  ({a})",
+            verb(r.applied, "confirmed  ", "would confirm")
+        );
+    }
+    for (p, a) in &r.dropped {
+        println!(
+            "{}  {p}  ({a}): not on the remote",
+            verb(r.applied, "forgot     ", "would forget")
+        );
+    }
+    for (p, a, size) in &r.imported {
+        println!(
+            "{}  {p}  ({a}, {size} bytes)",
+            verb(r.applied, "imported   ", "would import")
+        );
+    }
+    for (p, a, want, got) in &r.size_mismatch {
+        eprintln!("SIZE       {p} ({a}): index says {want}, remote has {got}");
+    }
+    for (p, a, want, got) in &r.partial {
+        eprintln!("PARTIAL    {p} ({a}): expected {want}, remote has {got}; left in place");
+    }
+    for (p, a, want, got) in &r.conflicts {
+        eprintln!("CONFLICT   {p} ({a}): other copies are {want} bytes, this one is {got}");
+    }
+    for (a, e) in &r.unreachable {
+        eprintln!("UNREACHABLE {a}: {e}; its entries were not touched");
+    }
+    if r.unverifiable > 0 {
+        println!(
+            "{} index entries are on accounts that are not connected",
+            r.unverifiable
+        );
+    }
+    if !r.applied && r.fixable() > 0 {
+        println!("dry run: nothing written; run again with --apply");
     }
 }

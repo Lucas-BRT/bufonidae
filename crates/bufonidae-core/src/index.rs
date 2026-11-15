@@ -56,6 +56,15 @@ pub struct IndexedFile {
     pub accounts: Vec<String>,
 }
 
+/// One row of the placements table, whatever its state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub path: String,
+    pub size: u64,
+    pub account_id: String,
+    pub state: State,
+}
+
 /// A placement whose upload started but was never confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPlacement {
@@ -204,6 +213,55 @@ impl Index {
             }
         }
         Ok(files)
+    }
+
+    /// Every placement (pending and done) whose path starts with `prefix`.
+    pub async fn placements(&self, prefix: &str) -> Result<Vec<Placement>, Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT i.path, i.size, p.account_id, p.state
+                 FROM items i JOIN placements p ON p.path = i.path
+                 WHERE substr(i.path, 1, length(?1)) = ?1
+                 ORDER BY i.path, p.account_id",
+                params![prefix],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let size: i64 = row.get(1)?;
+            let state: String = row.get(3)?;
+            out.push(Placement {
+                path: row.get(0)?,
+                size: u64::try_from(size).unwrap_or(0),
+                account_id: row.get(2)?,
+                state: if state == "done" {
+                    State::Done
+                } else {
+                    State::Pending
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Forgets the placement of `path` on `account_id`, and the file itself
+    /// when no placement is left. Touches the index only, never the remote.
+    pub async fn remove_placement(&self, path: &str, account_id: &str) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "DELETE FROM placements WHERE path = ?1 AND account_id = ?2",
+                params![path, account_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM items WHERE path = ?1
+                 AND NOT EXISTS (SELECT 1 FROM placements WHERE placements.path = ?1)",
+                params![path],
+            )
+            .await?;
+        Ok(())
     }
 
     /// Uploads that were started and never confirmed.

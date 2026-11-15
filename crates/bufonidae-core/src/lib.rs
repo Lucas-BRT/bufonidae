@@ -9,4 +9,5 @@ pub mod index;
 pub mod manager;
 pub mod placement;
 pub mod put;
+pub mod reconcile;
 pub mod secrets;
