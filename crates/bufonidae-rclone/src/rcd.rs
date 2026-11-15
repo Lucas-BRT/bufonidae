@@ -74,6 +74,8 @@ impl std::fmt::Debug for Rcd {
 impl Rcd {
     /// Starts `rclone rcd` from `binary` and waits until it is serving.
     pub async fn start(binary: impl AsRef<OsStr>) -> Result<Self, Error> {
+        let binary = binary.as_ref();
+        verify_binary(binary).await?;
         let user = random_hex().map_err(Error::Spawn)?;
         let pass = random_hex().map_err(Error::Spawn)?;
 
@@ -243,6 +245,24 @@ impl Rcd {
     pub async fn shutdown(mut self) -> Result<(), Error> {
         self.child.kill().await.map_err(Error::Spawn)
     }
+}
+
+/// Runs `rclone version` and refuses a binary Bufonidae is not tested with.
+async fn verify_binary(binary: &OsStr) -> Result<crate::Version, Error> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new(binary)
+            .arg("version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| Error::Startup("`rclone version` did not answer".into()))?
+    .map_err(Error::Spawn)?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let allow = std::env::var_os(crate::ALLOW_UNTESTED_ENV).is_some_and(|v| !v.is_empty());
+    crate::check_supported(&text, allow)
 }
 
 fn random_hex() -> std::io::Result<String> {
