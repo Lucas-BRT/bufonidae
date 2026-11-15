@@ -17,7 +17,8 @@ use clap::{Parser, Subcommand};
 
 /// Pool several Mega.nz accounts into one logical directory, via rclone.
 #[derive(Parser)]
-#[command(version, about)]
+// The binary is `bufonidae`; without this clap would name it after the crate.
+#[command(name = "bufonidae", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

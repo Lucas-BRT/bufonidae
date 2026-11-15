@@ -107,7 +107,7 @@ Implemented so far: `items(path, size)` and `placements(path, account_id, state)
 Honest list, most important first. Nothing here is hidden by the status above.
 
 1. **Live qualification** (`docs/QUALIFICATION.md`): the checklist exists and has not been run. Only login, upload, download and cancel were tried on a real account; everything else is tested with fakes.
-2. **Release pipeline**: exercised by hand-dispatch only (see `docs/RELEASING.md`); a real tag has never been pushed, nothing has been published, and `.deb` installation on a clean machine is untested.
+2. **Release pipeline**: a hand-dispatched run on GitHub passed end to end (tests, release build, packages, smoke run of what was packaged), and the resulting `.deb` installs on a clean Ubuntu 24.04 container with no rclone or Rust. A real tag has never been pushed and nothing has been published. Not yet tried: running the desktop app from the package under a display, and the tarball on another distribution.
 3. **A durable job queue and one long-lived rclone** (each operation still starts its own rclone and signs in again). A crash mid-store is recovered by Check, not resumed.
 4. **Rename and delete** inside the pool (they need an item identity separate from its path, and a journal for the operation).
 5. **Desktop gaps**: selecting several files to download at once, keyboard navigation and screen-reader support (unverified in the pinned gpui), first-run onboarding, translations.
