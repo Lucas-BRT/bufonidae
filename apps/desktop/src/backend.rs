@@ -272,6 +272,32 @@ impl Backend {
         })
     }
 
+    /// Reads the settings from disk.
+    pub fn load_config(&self) -> JoinHandle<Result<Config, String>> {
+        self.runtime.spawn(async move {
+            Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Changes the redundancy settings and returns the saved result.
+    pub fn change_redundancy(
+        &self,
+        change: RedundancyChange,
+    ) -> JoinHandle<Result<Config, String>> {
+        self.runtime.spawn(async move {
+            let mut config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            match change {
+                RedundancyChange::Default(copies) => config.set(None, copies),
+                RedundancyChange::Rule { folder, copies } => config.set(Some(&folder), copies),
+                RedundancyChange::RemoveRule(folder) => config.unset(&folder),
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+    }
+
     /// Saves the "ask before storing more than this" limit.
     pub fn save_large_upload_bytes(&self, bytes: u64) -> JoinHandle<Result<(), String>> {
         self.runtime.spawn(async move {
@@ -555,6 +581,18 @@ async fn connected_rcd(store: &AccountStore) -> Result<Connected, String> {
         usable,
         unreachable,
     })
+}
+
+/// A change to the redundancy settings.
+pub enum RedundancyChange {
+    /// Copies for every file without a folder rule.
+    Default(u8),
+    /// Copies for one folder (and what is under it).
+    Rule {
+        folder: String,
+        copies: u8,
+    },
+    RemoveRule(String),
 }
 
 /// What a files check found.
