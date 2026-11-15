@@ -536,12 +536,14 @@ pub struct DownloadJob {
 /// Starts rclone, with a message a person can act on when it is missing or
 /// not a supported version.
 async fn start_rclone() -> Result<Rcd, String> {
-    Rcd::start("rclone").await.map_err(|e| match e {
-        RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
-        }
-        e => e.to_string(),
-    })
+    Rcd::start(bufonidae_rclone::locate())
+        .await
+        .map_err(|e| match e {
+            RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
+            }
+            e => e.to_string(),
+        })
 }
 
 /// rclone with the accounts that could be defined in it.

@@ -1,6 +1,6 @@
 [package]
 name = "bufonidae-website"
-description = "Website for Bufonidae"
+description = "Website for Bufonidae, built with Topcoat"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Topcoat is added with the website itself, pinned exactly.
+[dependencies]
+# Pinned exactly: Topcoat is early-stage and breaks between releases.
+topcoat = { version = "=0.11.0", features = ["tailwind", "ui"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros"] }
+http = "=1.4.0"
+
+[build-dependencies]
+topcoat = { version = "=0.11.0", default-features = false, features = ["tailwind"] }
 
 [lints]
 workspace = true

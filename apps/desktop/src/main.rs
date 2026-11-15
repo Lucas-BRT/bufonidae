@@ -38,6 +38,9 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Matches `bufonidae.desktop`, so the shell shows the right
+                    // icon and groups the windows.
+                    app_id: Some("bufonidae".to_owned()),
                     window_min_size: Some(size(px(720.0), px(480.0))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Bufonidae".into()),

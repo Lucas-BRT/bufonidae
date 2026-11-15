@@ -1,0 +1,20 @@
+# The build context is the repository root (see compose.yaml). Cargo needs
+# every workspace member's manifest to read the lock file; only the website's
+# own files are compiled. The product files build.rs reads for the site's
+# facts are listed here too.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!vendor
+!crates/bufonidae-core/Cargo.toml
+!crates/bufonidae-rclone/Cargo.toml
+!crates/bufonidae-rclone/src/lib.rs
+!crates/bufonidae-cli/Cargo.toml
+!crates/bufonidae-cli/src/main.rs
+!apps/desktop/Cargo.toml
+!website/Cargo.toml
+!website/build.rs
+!website/src
+!website/assets
+!website/styles.css

@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
             }
             let code = rpassword::prompt_password("2FA code (empty if none): ")?;
             let two_fa = (!code.is_empty()).then_some(code.as_str());
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result =
@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
             if accounts.is_empty() {
                 bail!("no accounts connected; run `bufonidae account add` first");
             }
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
             if accounts.is_empty() {
                 bail!("no accounts connected; run `bufonidae account add` first");
             }
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
@@ -335,7 +335,7 @@ async fn main() -> Result<()> {
         }
         Command::Get { path, out } => {
             let index = Index::open(&Index::default_path()?).await?;
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
@@ -394,7 +394,7 @@ async fn main() -> Result<()> {
             }
             let config = Config::load(&config_path)?;
             let index = Index::open(&Index::default_path()?).await?;
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
             let code = rpassword::prompt_password("2FA code (empty if none): ")?;
             let two_fa = (!code.is_empty()).then_some(code.as_str());
 
-            let rcd = Rcd::start("rclone")
+            let rcd = Rcd::start(bufonidae_rclone::locate())
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = manager::add_account(

@@ -62,6 +62,44 @@ pub enum Error {
     },
 }
 
+/// Set this to the path of an rclone binary to use it instead of the one that
+/// ships with Bufonidae or the one on `PATH`. It is still version-checked.
+pub const RCLONE_ENV: &str = "BUFONIDAE_RCLONE";
+
+/// Where the rclone shipped inside a package sits, relative to the folder of
+/// the Bufonidae binary (`<prefix>/bin`): `<prefix>/libexec/bufonidae/rclone`.
+const BUNDLED: &str = "../libexec/bufonidae/rclone";
+
+/// The rclone to run: the one named by [`RCLONE_ENV`], else the one shipped
+/// with Bufonidae next to its binary, else `rclone` on `PATH`. A packaged
+/// Bufonidae therefore uses the rclone it was tested with and never touches
+/// the system's.
+#[must_use]
+pub fn locate() -> std::path::PathBuf {
+    locate_with(
+        std::env::var_os(RCLONE_ENV),
+        std::env::current_exe().ok(),
+        |path| path.is_file(),
+    )
+}
+
+fn locate_with(
+    from_env: Option<std::ffi::OsString>,
+    exe: Option<std::path::PathBuf>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    if let Some(path) = from_env.filter(|value| !value.is_empty()) {
+        return path.into();
+    }
+    if let Some(dir) = exe.as_deref().and_then(std::path::Path::parent) {
+        let bundled = dir.join(BUNDLED);
+        if exists(&bundled) {
+            return bundled;
+        }
+    }
+    std::path::PathBuf::from("rclone")
+}
+
 /// Longest diagnostic text kept from rclone, in characters.
 const MAX_DIAGNOSTIC: usize = 1000;
 
@@ -240,5 +278,29 @@ mod tests {
         // Length is capped.
         let long = "x".repeat(5000);
         assert!(escape_control(&long).chars().count() <= MAX_DIAGNOSTIC + 1);
+    }
+
+    #[test]
+    fn rclone_is_found_by_override_then_bundle_then_path() {
+        use std::path::{Path, PathBuf};
+        let exe = Some(PathBuf::from("/opt/bufonidae/bin/bufonidae"));
+        let bundled = PathBuf::from("/opt/bufonidae/bin/../libexec/bufonidae/rclone");
+        let has_bundle = |p: &Path| p == bundled;
+
+        // An explicit override wins, even over a bundled copy.
+        assert_eq!(
+            locate_with(Some("/custom/rclone".into()), exe.clone(), has_bundle),
+            PathBuf::from("/custom/rclone")
+        );
+        // An empty override is ignored.
+        assert_eq!(
+            locate_with(Some("".into()), exe.clone(), has_bundle),
+            bundled
+        );
+        // The shipped copy is used when it is there.
+        assert_eq!(locate_with(None, exe.clone(), has_bundle), bundled);
+        // Otherwise PATH, which is also what a development build does.
+        assert_eq!(locate_with(None, exe, |_| false), PathBuf::from("rclone"));
+        assert_eq!(locate_with(None, None, |_| true), PathBuf::from("rclone"));
     }
 }

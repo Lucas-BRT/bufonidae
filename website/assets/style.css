@@ -1,0 +1,30 @@
+/* Bufonidae website: the defaults of plain elements (text, lists, inline
+   code). Everything else is a Tailwind utility in a component. System fonts,
+   no external requests. */
+
+html { -webkit-text-size-adjust: 100%; color-scheme: light dark; }
+
+body { font: 1rem/1.7 var(--font-sans); min-height: 100vh; display: flex; flex-direction: column; }
+main { flex: 1; }
+
+:focus-visible { outline: 0.1875rem solid var(--ring); outline-offset: 0.1875rem; border-radius: 0.25rem; }
+
+a { color: var(--primary); text-underline-offset: 0.18em; }
+:where(nav, .no-underline) a { text-decoration: none; }
+
+h1, h2, h3 { font-weight: 700; line-height: 1.15; letter-spacing: -0.02em; margin: 0; text-wrap: balance; }
+h1 { font-size: clamp(2.2rem, 5vw, 3.4rem); }
+h2 { font-size: clamp(1.375rem, 2.4vw, 1.75rem); }
+h3 { font-size: 1.1rem; letter-spacing: -0.01em; }
+
+p { margin: 0 0 1.25rem; max-width: 40rem; }
+ul, ol { padding-left: 1.3rem; max-width: 42rem; }
+ul { list-style: disc; }
+ol { list-style: decimal; }
+li { margin-bottom: 0.75rem; }
+code {
+  font: 0.88em var(--font-mono); background: var(--card); border: 0.0625rem solid var(--border); color: var(--foreground);
+  padding: 0.1em 0.4em; border-radius: 0.3rem; overflow-wrap: anywhere;
+}
+pre { margin: 0 0 1.5rem; }
+pre code { display: block; border: 0; background: transparent; padding: 0; white-space: pre; overflow-wrap: normal; }

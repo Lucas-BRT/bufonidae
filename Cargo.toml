@@ -62,3 +62,10 @@ debug = false
 strip = true
 lto = "thin"
 codegen-units = 16
+
+# The website runs in an image, I/O-bound: size beats speed.
+[profile.website]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
