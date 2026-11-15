@@ -27,6 +27,8 @@ pub enum Error {
     Remote(String),
     #[error(transparent)]
     Index(#[from] index::Error),
+    #[error("no account could be used ({0})")]
+    NoUsableAccount(String),
     #[error("account {0:?} was given twice; each copy must go to a different account")]
     DuplicateAccount(String),
     #[error(
@@ -303,6 +305,8 @@ pub struct Report {
     /// the name exists twice): left alone, never overwritten.
     /// `(rel path, reason)`
     pub differs: Vec<(String, String)>,
+    /// Accounts that did not answer and took no part: `(label, reason)`.
+    pub unreachable: Vec<(String, String)>,
     pub skipped: Vec<PathBuf>,
 }
 
@@ -422,8 +426,29 @@ pub async fn put_observed<R: RemoteFs>(
     // What is already stored under each name, on any account.
     let mut present: HashMap<String, (Vec<u64>, bool)> = HashMap::new();
     let mut spaces = Vec::new();
-    for (i, account) in accounts.iter().enumerate() {
-        let listing = remote.list_files(account, &dest).await?;
+    // Only an account that answers takes part. One that does not is set aside
+    // and reported, so a single broken account does not stop the others; the
+    // redundancy rules then decide whether what is left can hold every copy.
+    let mut usable: Vec<Account> = Vec::new();
+    for account in accounts {
+        let probed = async {
+            let listing = remote.list_files(account, &dest).await?;
+            let free = remote
+                .free_space(account)
+                .await?
+                .ok_or_else(|| Error::Remote("it does not report its free space".to_owned()))?;
+            Ok::<_, Error>((listing, free))
+        }
+        .await;
+        let (listing, free) = match probed {
+            Ok(found) => found,
+            Err(e) => {
+                report
+                    .unreachable
+                    .push((account.label.clone(), e.to_string()));
+                continue;
+            }
+        };
         for (path, size) in listing.files {
             present.entry(path).or_default().0.push(size);
         }
@@ -431,17 +456,21 @@ pub async fn put_observed<R: RemoteFs>(
         for path in listing.duplicates {
             present.entry(path).or_default().1 = true;
         }
-        let free = remote.free_space(account).await?.ok_or_else(|| {
-            Error::Remote(format!(
-                "account {:?} does not report its free space",
-                account.label
-            ))
-        })?;
         spaces.push(AccountSpace {
-            id: AccountId(u32::try_from(i).map_err(|e| Error::Remote(e.to_string()))?),
+            id: AccountId(u32::try_from(usable.len()).map_err(|e| Error::Remote(e.to_string()))?),
             free_bytes: free,
         });
+        usable.push(account.clone());
     }
+    if usable.is_empty() {
+        let reasons: Vec<String> = report
+            .unreachable
+            .iter()
+            .map(|(label, why)| format!("{label}: {why}"))
+            .collect();
+        return Err(Error::NoUsableAccount(reasons.join("; ")));
+    }
+    let accounts = usable.as_slice();
 
     let mut todo = Vec::new();
     for file in files {
@@ -533,7 +562,7 @@ pub async fn put_observed<R: RemoteFs>(
             }
         };
         for AccountId(slot) in targets {
-            let account = &accounts[slot as usize];
+            let account = &accounts[slot as usize]; // `accounts` is now the usable list
             // Write-ahead: a crash after this line leaves a `pending` trace.
             index
                 .mark_pending_hashed(&remote_path, file.size, &account.id, Some(&hash))
@@ -748,7 +777,10 @@ mod tests {
             "Pics",
         )
         .await;
-        assert!(matches!(result, Err(Error::Remote(_))));
+        assert!(
+            matches!(result, Err(Error::NoUsableAccount(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1125,5 +1157,45 @@ mod tests {
             "nothing is 'done'"
         );
         assert_eq!(index.pending().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_account_that_does_not_answer_is_set_aside_and_the_rest_used() {
+        let dir = tree();
+        // "two" has no entry, so its free space is unknown.
+        let remote = fake(&[("one", 1000), ("three", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let report = put_with(
+            &remote,
+            &index,
+            &[dir.path().join("photos")],
+            &[account("one"), account("two"), account("three")],
+        )
+        .await
+        .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.unreachable.len(), 1);
+        assert_eq!(report.unreachable[0].0, "two");
+        assert!(remote.uploads.borrow().iter().all(|(a, _)| a != "two"));
+
+        // With mirroring, the accounts that remain decide whether it can work.
+        let remote = fake(&[("one", 1000)]);
+        let report = put(
+            &remote,
+            &Index::open_memory().await.unwrap(),
+            &[account("one"), account("two")],
+            &MostFreeSpace::default(),
+            &mirror(2),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.no_room.len(),
+            2,
+            "two copies are impossible with one account"
+        );
+        assert_eq!(report.unreachable.len(), 1);
     }
 }

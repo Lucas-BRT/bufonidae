@@ -241,6 +241,11 @@ async fn main() -> Result<()> {
             for (p, label) in &report.repaired {
                 println!("copied      {p}  ->  {label}");
             }
+            for (label, why) in &report.unreachable {
+                eprintln!(
+                    "UNREACHABLE {label}: left out, and the copies it holds were not counted: {why}"
+                );
+            }
             for p in &report.lost {
                 eprintln!("LOST        {p}: no copy on any connected account");
             }
@@ -317,17 +322,15 @@ async fn main() -> Result<()> {
         }
         Command::Get { path, out } => {
             let index = Index::open(&Index::default_path()?).await?;
-            let accounts = store.list().to_vec();
             let rcd = Rcd::start("rclone")
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
-                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
-                    if let Err(e) = result {
-                        eprintln!("warning: account {:?}: {e}", account.label);
-                    }
+                let usable = sign_in(&rcd, &store, &secrets).await;
+                if usable.is_empty() {
+                    bail!("no account could sign in");
                 }
-                Ok::<_, anyhow::Error>(get::get(&rcd, &index, &accounts, &path, &out).await?)
+                Ok::<_, anyhow::Error>(get::get(&rcd, &index, &usable, &path, &out).await?)
             }
             .await;
             rcd.shutdown().await?;
@@ -337,6 +340,9 @@ async fn main() -> Result<()> {
             }
             for p in &report.already_there {
                 println!("exists      {}", p.display());
+            }
+            for (label, why) in &report.unreachable {
+                eprintln!("UNREACHABLE {label}: not used: {why}");
             }
             for (p, reason) in &report.failed {
                 eprintln!("FAILED      {p}: {reason}");
@@ -372,16 +378,20 @@ async fn main() -> Result<()> {
                 .await
                 .context("could not start rclone; is it installed and on PATH?")?;
             let result = async {
-                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
-                    if chosen.iter().any(|c| c.id == account.id) {
-                        result.with_context(|| format!("account {:?}", account.label))?;
-                    }
+                let signed_in = sign_in(&rcd, &store, &secrets).await;
+                let usable: Vec<_> = chosen
+                    .iter()
+                    .filter(|c| signed_in.iter().any(|s| s.id == c.id))
+                    .cloned()
+                    .collect();
+                if usable.is_empty() {
+                    bail!("none of the chosen accounts could sign in");
                 }
                 Ok::<_, anyhow::Error>(
                     put::put(
                         &rcd,
                         &index,
-                        &chosen,
+                        &usable,
                         &MostFreeSpace::default(),
                         &config,
                         &paths,
@@ -441,6 +451,9 @@ fn print_report(report: &put::Report) {
     }
     for path in &report.skipped {
         println!("skipped   {} (symlink or unsupported name)", path.display());
+    }
+    for (label, why) in &report.unreachable {
+        eprintln!("UNREACHABLE {label}: not used: {why}");
     }
     for (rel, reason) in &report.differs {
         eprintln!("DIFFERS   {rel}: {reason}");
@@ -502,4 +515,25 @@ fn print_reconcile(r: &reconcile::Report) {
     if !r.applied && r.fixable() > 0 {
         println!("dry run: nothing written; run again with --apply");
     }
+}
+
+/// Signs every stored account in and returns those that worked; the others
+/// are warned about on stderr and left out, so one broken account does not
+/// stop work on the healthy ones.
+async fn sign_in(
+    rcd: &Rcd,
+    store: &AccountStore,
+    secrets: &manager::SharedSecrets,
+) -> Vec<bufonidae_core::account::Account> {
+    let mut usable = Vec::new();
+    for (account, result) in manager::connect_all(rcd, store, secrets).await {
+        match result {
+            Ok(()) => usable.push(account),
+            Err(e) => eprintln!(
+                "warning: account {:?} could not sign in and will not be used: {e}",
+                account.label
+            ),
+        }
+    }
+    usable
 }

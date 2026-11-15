@@ -19,8 +19,6 @@ pub enum Error {
     Index(#[from] index::Error),
     #[error("temporary folder: {0}")]
     Temp(#[from] std::io::Error),
-    #[error("account {0:?} does not report its free space")]
-    NoFreeSpace(String),
     #[error(transparent)]
     Remote(#[from] RemoteError),
 }
@@ -94,6 +92,9 @@ pub struct Report {
     pub no_room: Vec<(String, usize)>,
     /// `(path, reason)`
     pub failed: Vec<(String, String)>,
+    /// Accounts that did not answer and were left out: `(label, reason)`.
+    /// Copies they hold were not counted.
+    pub unreachable: Vec<(String, String)>,
 }
 
 impl Report {
@@ -114,27 +115,41 @@ pub async fn repair<R: RemoteFs>(
     config: &Config,
     prefix: &str,
 ) -> Result<Report, Error> {
+    let mut report = Report::default();
+
+    // Only an account that answers can be read from or written to. One that
+    // does not is set aside and reported, instead of stopping the repair for
+    // the accounts that work. Copies it holds are not counted while it is out.
+    let mut usable: Vec<Account> = Vec::new();
+    let mut spaces = Vec::new();
+    for account in accounts {
+        match remote.free_space(account).await {
+            Ok(Some(free)) => {
+                spaces.push(AccountSpace {
+                    id: AccountId(u32::try_from(usable.len()).unwrap_or(u32::MAX)),
+                    free_bytes: free,
+                });
+                usable.push(account.clone());
+            }
+            Ok(None) => report.unreachable.push((
+                account.label.clone(),
+                "it does not report its free space".to_owned(),
+            )),
+            Err(e) => report
+                .unreachable
+                .push((account.label.clone(), e.to_string())),
+        }
+    }
+    let accounts = usable.as_slice();
+
     let mut gaps = find_gaps(index, accounts, config, prefix).await?;
     gaps.sort_by_key(|g| std::cmp::Reverse(g.size));
-
-    let mut spaces = Vec::new();
-    for (i, account) in accounts.iter().enumerate() {
-        let free = remote
-            .free_space(account)
-            .await?
-            .ok_or_else(|| Error::NoFreeSpace(account.label.clone()))?;
-        spaces.push(AccountSpace {
-            id: AccountId(u32::try_from(i).unwrap_or(u32::MAX)),
-            free_bytes: free,
-        });
-    }
     let slot_of: HashMap<&str, AccountId> = accounts
         .iter()
         .zip(&spaces)
         .map(|(a, s)| (a.id.as_str(), s.id))
         .collect();
 
-    let mut report = Report::default();
     for gap in gaps {
         if gap.holders.is_empty() {
             report.lost.push(gap.path);
@@ -462,5 +477,26 @@ mod tests {
         assert!(r.repaired.is_empty(), "nothing damaged was propagated");
         assert!(r.failed[0].1.contains("hash"), "{:?}", r.failed);
         assert!(fake.uploads.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_account_that_does_not_answer_is_set_aside_and_the_rest_still_repaired() {
+        // "b" has no entry, so asking for its free space fails.
+        let (index, mut fake) = setup(&[("x.bin", 10, &["a"])]).await;
+        fake.free.remove("b");
+        let accounts = [account("a"), account("b"), account("c")];
+        let r = repair(
+            &fake,
+            &index,
+            &accounts,
+            &MostFreeSpace::default(),
+            &mirror(2),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.repaired, [("x.bin".to_owned(), "c".to_owned())]);
+        assert_eq!(r.unreachable.len(), 1);
+        assert_eq!(r.unreachable[0].0, "b");
     }
 }

@@ -137,7 +137,12 @@ impl Backend {
             let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
 
-            let rcd = connected_rcd(&store).await?;
+            let Connected {
+                rcd,
+                usable,
+                unreachable,
+            } = connected_rcd(&store).await?;
+            let accounts = usable;
             let outcome = async {
                 // A dropped sender is not a cancel request.
                 let cancelled = async {
@@ -162,7 +167,13 @@ impl Backend {
                 );
                 tokio::pin!(store);
                 tokio::select! {
-                    report = &mut store => report.map(StoreOutcome::Done).map_err(|e| e.to_string()),
+                    report = &mut store => report
+                        .map(|mut r| {
+                            // Accounts that could not even sign in.
+                            r.unreachable.extend(unreachable.iter().cloned());
+                            StoreOutcome::Done(r)
+                        })
+                        .map_err(|e| e.to_string()),
                     () = cancelled => Ok(StoreOutcome::Cancelled),
                 }
             }
@@ -192,7 +203,12 @@ impl Backend {
             if accounts.is_empty() {
                 return Err("Connect a Mega account first.".to_owned());
             }
-            let rcd = connected_rcd(&store).await?;
+            let Connected {
+                rcd,
+                usable,
+                unreachable,
+            } = connected_rcd(&store).await?;
+            let accounts = usable;
             let outcome = async {
                 // A dropped sender is not a cancel request.
                 let cancelled = async {
@@ -208,7 +224,12 @@ impl Backend {
                 tokio::pin!(download);
                 tokio::select! {
                     report = &mut download => {
-                        report.map(DownloadOutcome::Done).map_err(|e| e.to_string())
+                        report
+                            .map(|mut r| {
+                                r.unreachable.extend(unreachable.iter().cloned());
+                                DownloadOutcome::Done(r)
+                            })
+                            .map_err(|e| e.to_string())
                     }
                     () = cancelled => Ok(DownloadOutcome::Cancelled),
                 }
@@ -323,10 +344,20 @@ pub struct DownloadJob {
     pub result: JoinHandle<Result<DownloadOutcome, String>>,
 }
 
-/// Starts rclone and defines every stored account in it. Every account is
-/// connected because any of them may hold what is needed. On failure rclone
-/// is stopped before the error is returned.
-async fn connected_rcd(store: &AccountStore) -> Result<Rcd, String> {
+/// rclone with the accounts that could be defined in it.
+struct Connected {
+    rcd: Rcd,
+    /// Accounts that signed in and may be used.
+    usable: Vec<Account>,
+    /// Accounts that could not be reached, with why: `(label, reason)`.
+    unreachable: Vec<(String, String)>,
+}
+
+/// Starts rclone and defines every stored account in it. An account that fails
+/// to sign in is set aside and reported rather than stopping the others, so
+/// that one broken account does not block files held by the healthy ones.
+/// Fails only when no account could be used, stopping rclone first.
+async fn connected_rcd(store: &AccountStore) -> Result<Connected, String> {
     let rcd = Rcd::start("rclone").await.map_err(|e| match e {
         RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
             "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
@@ -334,13 +365,27 @@ async fn connected_rcd(store: &AccountStore) -> Result<Rcd, String> {
         e => e.to_string(),
     })?;
     let secrets: SharedSecrets = Arc::new(KeyringStore);
+    let mut usable = Vec::new();
+    let mut unreachable = Vec::new();
     for (account, result) in manager::connect_all(&rcd, store, &secrets).await {
-        if let Err(e) = result {
-            let _ = rcd.shutdown().await;
-            return Err(format!("Account {:?}: {e}", account.label));
+        match result {
+            Ok(()) => usable.push(account),
+            Err(e) => unreachable.push((account.label, e.to_string())),
         }
     }
-    Ok(rcd)
+    if usable.is_empty() {
+        let _ = rcd.shutdown().await;
+        let reasons: Vec<String> = unreachable
+            .iter()
+            .map(|(label, why)| format!("{label}: {why}"))
+            .collect();
+        return Err(format!("No account could be used. {}", reasons.join("; ")));
+    }
+    Ok(Connected {
+        rcd,
+        usable,
+        unreachable,
+    })
 }
 
 /// One entry of the file browser.

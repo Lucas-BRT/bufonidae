@@ -29,6 +29,9 @@ pub struct Report {
     pub already_there: Vec<PathBuf>,
     /// `(path, reason)`
     pub failed: Vec<(String, String)>,
+    /// Accounts that could not be reached and were not used: `(label,
+    /// reason)`. Filled in by the caller that connected them.
+    pub unreachable: Vec<(String, String)>,
 }
 
 impl Report {

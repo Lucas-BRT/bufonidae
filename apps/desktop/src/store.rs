@@ -446,6 +446,13 @@ impl Render for StoreForm {
                         muted,
                     );
                 }
+                for (label, why) in &report.unreachable {
+                    push(
+                        IconName::TriangleAlert,
+                        format!("Account {label} could not be reached and was not used: {why}"),
+                        danger,
+                    );
+                }
                 for (rel, reason) in report.differs.iter().take(MAX_LISTED) {
                     push(
                         IconName::TriangleAlert,

@@ -277,6 +277,13 @@ impl Render for DownloadForm {
                         muted,
                     );
                 }
+                for (label, why) in &report.unreachable {
+                    push(
+                        IconName::TriangleAlert,
+                        format!("Account {label} could not be reached and was not used: {why}"),
+                        danger,
+                    );
+                }
                 for (path, reason) in report.failed.iter().take(MAX_LISTED) {
                     push(IconName::CircleX, format!("{path}: {reason}"), danger);
                 }
