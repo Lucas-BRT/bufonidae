@@ -8,10 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# gpui and gpui-component are added in MVP-2, pinned exactly.
-
 [dependencies]
 bufonidae-core.workspace = true
+gpui.workspace = true
 
 [lints]
 workspace = true

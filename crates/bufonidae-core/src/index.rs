@@ -29,6 +29,11 @@ pub enum Error {
     TooNew { found: i64 },
     #[error("could not determine the data directory")]
     NoDataDir,
+    #[error(
+        "the index is in use by another Bufonidae process (is the desktop app or \
+         another command running?); close it and try again"
+    )]
+    InUse,
 }
 
 /// Confirmed or in-flight placement of a file on an account.
@@ -114,7 +119,14 @@ impl Index {
     }
 
     async fn build(location: &str) -> Result<Self, Error> {
-        let db = Builder::new_local(location).build().await?;
+        let db = Builder::new_local(location).build().await.map_err(|e| {
+            // Turso allows one process per database file.
+            if e.to_string().contains("locked by another process") {
+                Error::InUse
+            } else {
+                Error::Db(e)
+            }
+        })?;
         let conn = db.connect()?;
         let index = Self { conn };
         index.migrate().await?;
@@ -345,5 +357,54 @@ mod tests {
         assert_eq!(index.list("").await.unwrap().len(), 1);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Helper for the cross-process test below, inert otherwise: opens the
+    /// index named by `BUFONIDAE_HOLD_INDEX` and holds it until stdin closes.
+    #[tokio::test]
+    async fn hold_index_open_helper() {
+        let Some(path) = std::env::var_os("BUFONIDAE_HOLD_INDEX") else {
+            return;
+        };
+        let _index = Index::open(Path::new(&path)).await.unwrap();
+        println!("ready");
+        std::io::stdin().read_line(&mut String::new()).ok();
+    }
+
+    /// Turso allows one process per database file. Same-process opens are
+    /// fine, so this needs a second process: the test binary relaunches
+    /// itself as the holder.
+    #[tokio::test]
+    async fn another_process_holding_the_index_reports_in_use() {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "index::tests::hold_index_open_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("BUFONIDAE_HOLD_INDEX", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        // Keep the reader alive until the child exits: a closed pipe would
+        // make its final test output fail with a broken pipe.
+        let mut lines = BufReader::new(stdout).lines().map_while(Result::ok);
+        let ready = lines.by_ref().any(|line| line.contains("ready"));
+        assert!(ready, "the holder process never opened the index");
+
+        let result = Index::open(&path).await;
+
+        drop(child.stdin.take());
+        lines.for_each(drop);
+        child.wait().unwrap();
+        assert!(matches!(result, Err(Error::InUse)), "{result:?}");
     }
 }
