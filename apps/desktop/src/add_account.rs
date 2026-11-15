@@ -27,8 +27,18 @@ enum Phase {
     Failed(String),
 }
 
+/// What the form is for.
+#[derive(Clone)]
+enum Mode {
+    /// Connect a new account.
+    New,
+    /// Sign an existing account in again (a new password, or after a restore).
+    Reauth { label: String, email: String },
+}
+
 pub struct AddAccountForm {
     backend: Arc<Backend>,
+    mode: Mode,
     email: Entity<InputState>,
     password: Entity<InputState>,
     code: Entity<InputState>,
@@ -59,12 +69,29 @@ impl AddAccountForm {
 
         Self {
             backend,
+            mode: Mode::New,
             email,
             password,
             code,
             name,
             phase: Phase::Editing,
         }
+    }
+
+    /// The same form, for signing `label` in again: only the password and the
+    /// 2FA code are asked for.
+    pub fn reauth(
+        backend: Arc<Backend>,
+        label: String,
+        email: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut form = Self::new(backend, window, cx);
+        form.mode = Mode::Reauth { label, email };
+        form.password
+            .update(cx, |state, cx| state.focus(window, cx));
+        form
     }
 
     /// Closes the form, except while a sign-in runs: closing then would leave
@@ -83,6 +110,22 @@ impl AddAccountForm {
         let password = self.password.read(cx).value().to_string();
         let code = self.code.read(cx).value().trim().to_owned();
         let name = self.name.read(cx).value().trim().to_owned();
+
+        if let Mode::Reauth { label, .. } = self.mode.clone() {
+            if password.is_empty() {
+                self.phase = Phase::Failed("Enter your Mega password.".into());
+                cx.notify();
+                return;
+            }
+            for secret in [&self.password, &self.code] {
+                secret.update(cx, |field, cx| field.set_value("", window, cx));
+            }
+            let job = self
+                .backend
+                .reauthorize(label, password, (!code.is_empty()).then_some(code));
+            self.run(job, cx);
+            return;
+        }
 
         if !email.contains('@') {
             self.phase = Phase::Failed("Enter the e-mail address of your Mega account.".into());
@@ -112,9 +155,14 @@ impl AddAccountForm {
             secret.update(cx, |field, cx| field.set_value("", window, cx));
         }
 
+        let job = self.backend.add_account(request);
+        self.run(job, cx);
+    }
+
+    /// Waits for a sign-in job and reports how it ended.
+    fn run(&mut self, job: tokio::task::JoinHandle<Result<(), String>>, cx: &mut Context<Self>) {
         self.phase = Phase::Submitting;
         cx.notify();
-        let job = self.backend.add_account(request);
         cx.spawn(async move |this, cx| {
             let result = match job.await {
                 Ok(result) => result,
@@ -199,15 +247,32 @@ impl Render for AddAccountForm {
                 div()
                     .v_flex()
                     .gap_1()
-                    .child(div().text_xl().font_semibold().child("Add a Mega account"))
-                    .child(div().text_color(muted).child(
-                        "Your password stays in the system keyring and is never written to a file.",
-                    )),
+                    .child(div().text_xl().font_semibold().child(match &self.mode {
+                        Mode::New => "Add a Mega account".to_owned(),
+                        Mode::Reauth { .. } => "Sign in again".to_owned(),
+                    }))
+                    .child(
+                        div().text_color(muted).child(match &self.mode {
+                            Mode::New => "Your password stays in the system keyring and is never \
+                                      written to a file."
+                                .to_owned(),
+                            Mode::Reauth { label, email } => format!(
+                                "{label} ({email}). Enter the password again; it replaces the one \
+                             stored in the system keyring."
+                            ),
+                        }),
+                    ),
             )
-            .child(self.field(cx, "E-mail", &self.email, submitting))
+            .children(
+                matches!(self.mode, Mode::New)
+                    .then(|| self.field(cx, "E-mail", &self.email, submitting)),
+            )
             .child(self.field(cx, "Password", &self.password, submitting))
             .child(self.field(cx, "2FA code", &self.code, submitting))
-            .child(self.field(cx, "Name", &self.name, submitting))
+            .children(
+                matches!(self.mode, Mode::New)
+                    .then(|| self.field(cx, "Name", &self.name, submitting)),
+            )
             .children(status)
             .child(
                 div()
@@ -223,7 +288,10 @@ impl Render for AddAccountForm {
                     .child(
                         Button::new("connect")
                             .primary()
-                            .label("Connect account")
+                            .label(match &self.mode {
+                                Mode::New => "Connect account",
+                                Mode::Reauth { .. } => "Sign in",
+                            })
                             .loading(submitting)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),

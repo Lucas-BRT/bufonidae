@@ -16,10 +16,11 @@ use gpui_component::{
 };
 
 use crate::add_account::{AddAccountForm, FormEvent};
-use crate::backend::{Backend, Snapshot, StartupError};
+use crate::backend::{AccountHealth, Backend, HealthStatus, Snapshot, StartupError};
 use crate::browse::{BrowseEvent, BrowseForm};
 use crate::download::{DownloadEvent, DownloadForm};
 use crate::format;
+use crate::remove_account::{RemoveEvent, RemoveForm};
 use crate::settings::SettingsView;
 use crate::store::{StoreEvent, StoreForm};
 use crate::theme;
@@ -30,6 +31,24 @@ enum Modal {
     Store(Entity<StoreForm>),
     Browse(Entity<BrowseForm>),
     Download(Entity<DownloadForm>),
+    Remove(Entity<RemoveForm>),
+}
+
+/// What the Accounts screen knows about each account's state.
+pub(crate) enum Health {
+    NotChecked,
+    Checking,
+    Ready(Vec<AccountHealth>),
+    Failed(String),
+}
+
+impl Health {
+    pub(crate) fn of(&self, account_id: &str) -> Option<&HealthStatus> {
+        match self {
+            Self::Ready(all) => all.iter().find(|h| h.id == account_id).map(|h| &h.status),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +71,7 @@ pub struct BufonidaeApp {
     pub(crate) folder: String,
     data: Data,
     modal: Option<Modal>,
+    pub(crate) health: Health,
     /// Absent when the app could not start.
     settings: Option<Entity<SettingsView>>,
 }
@@ -72,6 +92,7 @@ impl BufonidaeApp {
             folder: String::new(),
             data: Data::Loading,
             modal: None,
+            health: Health::NotChecked,
             settings: None,
         };
         if let Ok(backend) = &app.backend {
@@ -137,6 +158,99 @@ impl BufonidaeApp {
         })
         .detach();
         self.modal = Some(Modal::Store(form));
+        cx.notify();
+    }
+
+    /// Asks every account for its space. Signs in to each, so it runs when the
+    /// user opens the Accounts screen or presses Check, not on every start.
+    pub(crate) fn check_health(&mut self, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if matches!(self.health, Health::Checking) {
+            return;
+        }
+        self.health = Health::Checking;
+        cx.notify();
+        let job = backend.check_health();
+        cx.spawn(async move |this, cx| {
+            let result = match job.await {
+                Ok(result) => result,
+                Err(join_error) => Err(join_error.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.health = match result {
+                    Ok(all) => Health::Ready(all),
+                    Err(message) => Health::Failed(message),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the sign-in-again dialog for an account.
+    pub(crate) fn open_reauth(
+        &mut self,
+        label: String,
+        email: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if self.modal.is_some() {
+            return;
+        }
+        let backend = Arc::clone(backend);
+        let form = cx.new(|cx| AddAccountForm::reauth(backend, label, email, window, cx));
+        cx.subscribe(&form, |this, _form, event: &FormEvent, cx| {
+            this.modal = None;
+            if matches!(event, FormEvent::Added) {
+                // A new password can change what the account reports.
+                this.reload(cx);
+                this.check_health(cx);
+            }
+            cx.notify();
+        })
+        .detach();
+        self.modal = Some(Modal::AddAccount(form));
+        cx.notify();
+    }
+
+    /// Opens the remove-account confirmation.
+    pub(crate) fn open_remove(&mut self, account_id: &str, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        let (Some(snapshot), None) = (self.snapshot(), &self.modal) else {
+            return;
+        };
+        let Some(account) = snapshot.accounts.iter().find(|a| a.id == account_id) else {
+            return;
+        };
+        let (files, _) = snapshot.usage(&account.id);
+        let form = cx.new(|_| {
+            RemoveForm::new(
+                Arc::clone(backend),
+                account.label.clone(),
+                account.email.clone(),
+                files,
+                snapshot.only_on(&account.id),
+            )
+        });
+        cx.subscribe(&form, |this, _form, event: &RemoveEvent, cx| {
+            this.modal = None;
+            if matches!(event, RemoveEvent::Removed) {
+                this.reload(cx);
+                this.health = Health::NotChecked;
+            }
+            cx.notify();
+        })
+        .detach();
+        self.modal = Some(Modal::Remove(form));
         cx.notify();
     }
 
@@ -253,6 +367,10 @@ impl BufonidaeApp {
                 .active(self.screen == target)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.screen = target;
+                    // The first visit to Accounts asks each account for its space.
+                    if target == Screen::Accounts && matches!(this.health, Health::NotChecked) {
+                        this.check_health(cx);
+                    }
                     cx.notify();
                 }))
         };
@@ -347,6 +465,7 @@ impl Render for BufonidaeApp {
             Modal::Store(form) => form.clone().into_any_element(),
             Modal::Browse(form) => form.clone().into_any_element(),
             Modal::Download(form) => form.clone().into_any_element(),
+            Modal::Remove(form) => form.clone().into_any_element(),
         });
         let overlay = overlay.map(|form| {
             // A scrim over the whole window with the form centred on it.
@@ -368,6 +487,7 @@ impl Render for BufonidaeApp {
                         Some(Modal::Store(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         Some(Modal::Browse(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         Some(Modal::Download(form)) => form.update(cx, |f, cx| f.close(cx)),
+                        Some(Modal::Remove(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         None => {}
                     }
                 }))

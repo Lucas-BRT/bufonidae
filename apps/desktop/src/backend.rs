@@ -39,6 +39,14 @@ impl Snapshot {
         self.files.iter().map(|f| f.size).sum()
     }
 
+    /// How many files have a copy on this account and on no other.
+    pub fn only_on(&self, account_id: &str) -> usize {
+        self.files
+            .iter()
+            .filter(|f| f.accounts.len() == 1 && f.accounts[0] == account_id)
+            .count()
+    }
+
     /// `(files, bytes)` stored on the account with this id.
     pub fn usage(&self, account_id: &str) -> (usize, u64) {
         self.files
@@ -265,6 +273,86 @@ impl Backend {
         })
     }
 
+    /// Asks every account how much space it has. This signs in to each one, so
+    /// it runs when the user asks, not on every start.
+    pub fn check_health(&self) -> JoinHandle<Result<Vec<AccountHealth>, String>> {
+        self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if store.list().is_empty() {
+                return Ok(Vec::new());
+            }
+            let rcd = start_rclone().await?;
+            let secrets: SharedSecrets = Arc::new(KeyringStore);
+            let mut health = Vec::new();
+            for (account, signed_in) in manager::connect_all(&rcd, &store, &secrets).await {
+                let status = match signed_in {
+                    Err(e) => {
+                        HealthStatus::Unreachable(bufonidae_rclone::escape_control(&e.to_string()))
+                    }
+                    Ok(()) => {
+                        let remote = format!("{}:", account.remote_name());
+                        let ask = rcd.about(&remote);
+                        match tokio::time::timeout(std::time::Duration::from_secs(30), ask).await {
+                            Ok(Ok(about)) => HealthStatus::Ok {
+                                total: about.total,
+                                used: about.used,
+                                free: about.free,
+                            },
+                            Ok(Err(e)) => HealthStatus::Unreachable(e.to_string()),
+                            Err(_) => HealthStatus::Unreachable(
+                                "it did not answer within 30 seconds".to_owned(),
+                            ),
+                        }
+                    }
+                };
+                health.push(AccountHealth {
+                    id: account.id,
+                    status,
+                });
+            }
+            let _ = rcd.shutdown().await;
+            Ok(health)
+        })
+    }
+
+    /// Signs an existing account in again (new password, or after a restore).
+    pub fn reauthorize(
+        &self,
+        label: String,
+        password: String,
+        two_fa: Option<String>,
+    ) -> JoinHandle<Result<(), String>> {
+        self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let rcd = start_rclone().await?;
+            let secrets: SharedSecrets = Arc::new(KeyringStore);
+            let result =
+                manager::reauthorize(&rcd, &store, &secrets, &label, &password, two_fa.as_deref())
+                    .await;
+            let _ = rcd.shutdown().await;
+            result.map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Forgets an account and its stored secrets. Files stay in the Mega
+    /// account; the index keeps its record of them.
+    pub fn remove_account(&self, label: String) -> JoinHandle<Result<(), String>> {
+        self.runtime.spawn(async move {
+            let mut store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let secrets: SharedSecrets = Arc::new(KeyringStore);
+            manager::remove_account(&mut store, &secrets, &label)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Connects a Mega account: proves the login through rclone, then stores
     /// the account and its secrets. Nothing is kept when it fails.
     pub fn add_account(&self, request: NewAccount) -> JoinHandle<Result<(), String>> {
@@ -276,12 +364,7 @@ impl Backend {
                 .prepare(&request.label, &request.email)
                 .map_err(|e| e.to_string())?;
 
-            let rcd = Rcd::start("rclone").await.map_err(|e| match e {
-                RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                    "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
-                }
-                e => e.to_string(),
-            })?;
+            let rcd = start_rclone().await?;
             let secrets: SharedSecrets = Arc::new(KeyringStore);
             let result = manager::add_account(
                 &rcd,
@@ -344,6 +427,17 @@ pub struct DownloadJob {
     pub result: JoinHandle<Result<DownloadOutcome, String>>,
 }
 
+/// Starts rclone, with a message a person can act on when it is missing or
+/// not a supported version.
+async fn start_rclone() -> Result<Rcd, String> {
+    Rcd::start("rclone").await.map_err(|e| match e {
+        RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
+        }
+        e => e.to_string(),
+    })
+}
+
 /// rclone with the accounts that could be defined in it.
 struct Connected {
     rcd: Rcd,
@@ -358,12 +452,7 @@ struct Connected {
 /// that one broken account does not block files held by the healthy ones.
 /// Fails only when no account could be used, stopping rclone first.
 async fn connected_rcd(store: &AccountStore) -> Result<Connected, String> {
-    let rcd = Rcd::start("rclone").await.map_err(|e| match e {
-        RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
-        }
-        e => e.to_string(),
-    })?;
+    let rcd = start_rclone().await?;
     let secrets: SharedSecrets = Arc::new(KeyringStore);
     let mut usable = Vec::new();
     let mut unreachable = Vec::new();
@@ -386,6 +475,25 @@ async fn connected_rcd(store: &AccountStore) -> Result<Connected, String> {
         usable,
         unreachable,
     })
+}
+
+/// How one account is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountHealth {
+    pub id: String,
+    pub status: HealthStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthStatus {
+    /// Signed in. Mega may leave a figure unknown.
+    Ok {
+        total: Option<u64>,
+        used: Option<u64>,
+        free: Option<u64>,
+    },
+    /// Could not sign in or did not answer, with why.
+    Unreachable(String),
 }
 
 /// One entry of the file browser.
@@ -461,6 +569,29 @@ pub fn suggest_label(email: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_files_that_exist_on_one_account_only() {
+        let file = |path: &str, accounts: &[&str]| IndexedFile {
+            path: path.to_owned(),
+            size: 10,
+            accounts: accounts.iter().map(|a| (*a).to_owned()).collect(),
+            blake3: None,
+        };
+        let snapshot = Snapshot {
+            accounts: Vec::new(),
+            files: vec![
+                file("only-a", &["a"]),
+                file("both", &["a", "b"]),
+                file("only-b", &["b"]),
+                file("also-only-a", &["a"]),
+            ],
+        };
+        assert_eq!(snapshot.only_on("a"), 2);
+        assert_eq!(snapshot.only_on("b"), 1);
+        assert_eq!(snapshot.only_on("nobody"), 0);
+        assert_eq!(snapshot.usage("a"), (3, 30), "all files with a copy on a");
+    }
 
     #[test]
     fn covers_the_home_folder_and_its_ancestors_only() {

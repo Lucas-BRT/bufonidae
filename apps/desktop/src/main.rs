@@ -6,6 +6,7 @@ mod browse;
 mod download;
 mod files;
 mod format;
+mod remove_account;
 mod settings;
 mod store;
 mod theme;
