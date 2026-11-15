@@ -4,6 +4,7 @@
 //! This crate depends on neither the GUI nor the CLI.
 
 pub mod account;
+pub mod get;
 pub mod index;
 pub mod manager;
 pub mod placement;

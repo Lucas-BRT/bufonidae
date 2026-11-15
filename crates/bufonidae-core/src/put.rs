@@ -39,6 +39,15 @@ pub trait RemoteFs {
         account: &Account,
         dir: &str,
     ) -> impl Future<Output = Result<HashSet<String>, Error>>;
+    /// Copies `remote_path` from the account to `dest_dir/dest_rel` on the
+    /// local disk.
+    fn download(
+        &self,
+        account: &Account,
+        remote_path: &str,
+        dest_dir: &Path,
+        dest_rel: &str,
+    ) -> impl Future<Output = Result<(), Error>>;
     /// Copies `parent/name` from the local disk to `remote_path` on the account.
     fn upload(
         &self,
@@ -70,6 +79,23 @@ impl RemoteFs for Rcd {
             }
             Err(e) => Err(Error::Remote(e.to_string())),
         }
+    }
+
+    async fn download(
+        &self,
+        account: &Account,
+        remote_path: &str,
+        dest_dir: &Path,
+        dest_rel: &str,
+    ) -> Result<(), Error> {
+        self.copy_file(
+            &format!("{}:", account.remote_name()),
+            remote_path,
+            &dest_dir.to_string_lossy(),
+            dest_rel,
+        )
+        .await
+        .map_err(|e| Error::Remote(e.to_string()))
     }
 
     async fn upload(
@@ -332,6 +358,9 @@ mod tests {
         }
         async fn existing_files(&self, a: &Account, _: &str) -> Result<HashSet<String>, Error> {
             Ok(self.existing.get(&a.label).cloned().unwrap_or_default())
+        }
+        async fn download(&self, _: &Account, _: &str, _: &Path, _: &str) -> Result<(), Error> {
+            Err(Error::Remote("not used by put".into()))
         }
         async fn upload(&self, a: &Account, _: &Path, _: &str, to: &str) -> Result<(), Error> {
             if self.fail_uploads {

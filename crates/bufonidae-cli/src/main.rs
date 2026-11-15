@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use bufonidae_core::account::AccountStore;
+use bufonidae_core::get;
 use bufonidae_core::index::Index;
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
@@ -31,6 +32,20 @@ enum Command {
         /// Accounts to use (default: all connected accounts).
         #[arg(long, value_delimiter = ',')]
         accounts: Vec<String>,
+    },
+    /// List stored files (from the local index, no network needed).
+    Ls {
+        /// Only files under this folder.
+        #[arg(default_value = "")]
+        prefix: String,
+    },
+    /// Download a file or folder from the pool.
+    Get {
+        /// File or folder, as shown by `ls`.
+        path: String,
+        /// Local destination folder.
+        #[arg(long, default_value = ".")]
+        out: std::path::PathBuf,
     },
     /// Manage connected Mega accounts.
     #[command(subcommand)]
@@ -62,6 +77,60 @@ async fn main() -> Result<()> {
     let secrets: SharedSecrets = Arc::new(KeyringStore);
 
     match cli.command {
+        Command::Ls { prefix } => {
+            let index = Index::open(&Index::default_path()?).await?;
+            let prefix = prefix.trim_matches('/');
+            for file in index.list(prefix).await? {
+                if !(prefix.is_empty()
+                    || file.path == prefix
+                    || file.path.starts_with(&format!("{prefix}/")))
+                {
+                    continue;
+                }
+                let labels: Vec<&str> = file
+                    .accounts
+                    .iter()
+                    .map(|id| {
+                        store
+                            .list()
+                            .iter()
+                            .find(|a| &a.id == id)
+                            .map_or("?", |a| a.label.as_str())
+                    })
+                    .collect();
+                println!("{:>12}  {}  {}", file.size, labels.join(","), file.path);
+            }
+        }
+        Command::Get { path, out } => {
+            let index = Index::open(&Index::default_path()?).await?;
+            let accounts = store.list().to_vec();
+            let rcd = Rcd::start("rclone")
+                .await
+                .context("could not start rclone; is it installed and on PATH?")?;
+            let result = async {
+                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
+                    if let Err(e) = result {
+                        eprintln!("warning: account {:?}: {e}", account.label);
+                    }
+                }
+                Ok::<_, anyhow::Error>(get::get(&rcd, &index, &accounts, &path, &out).await?)
+            }
+            .await;
+            rcd.shutdown().await?;
+            let report = result?;
+            for (p, label, size) in &report.downloaded {
+                println!("downloaded  {p}  <-  {label}  ({size} bytes)");
+            }
+            for p in &report.already_there {
+                println!("exists      {}", p.display());
+            }
+            for (p, reason) in &report.failed {
+                eprintln!("FAILED      {p}: {reason}");
+            }
+            if !report.is_complete() {
+                std::process::exit(1);
+            }
+        }
         Command::Put {
             paths,
             to,
