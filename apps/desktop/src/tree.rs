@@ -119,6 +119,7 @@ mod tests {
             path: path.to_owned(),
             size,
             accounts: vec!["a".to_owned()],
+            blake3: None,
         }
     }
 

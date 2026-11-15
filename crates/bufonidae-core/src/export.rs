@@ -63,6 +63,9 @@ pub struct Export {
     pub config: Config,
     pub placements: Vec<ExportedPlacement>,
     pub lost: Vec<ExportedLost>,
+    /// BLAKE3 of files, by path. Absent in backups made before hashes existed.
+    #[serde(default)]
+    pub hashes: std::collections::BTreeMap<String, String>,
 }
 
 /// Reads everything into one value. Secrets are not part of it.
@@ -95,6 +98,7 @@ pub async fn collect(
             size: l.size,
         })
         .collect();
+    let hashes = index.hashes("").await?.into_iter().collect();
     Ok(Export {
         format: FORMAT,
         written_by: env!("CARGO_PKG_VERSION").to_owned(),
@@ -102,6 +106,7 @@ pub async fn collect(
         config: config.clone(),
         placements,
         lost,
+        hashes,
     })
 }
 
@@ -160,6 +165,18 @@ fn validate(export: &Export) -> Result<(), Error> {
             return bad(format!("unsafe path {:?}", l.path));
         }
     }
+    for (path, hash) in &export.hashes {
+        let known =
+            size_of.contains_key(path.as_str()) || export.lost.iter().any(|l| &l.path == path);
+        if !known {
+            return bad(format!(
+                "{path}: a hash for a file that is not in the export"
+            ));
+        }
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return bad(format!("{path}: not a BLAKE3 hash"));
+        }
+    }
     Ok(())
 }
 
@@ -200,7 +217,8 @@ pub async fn restore(
     if !accounts.list().is_empty() {
         return Err(account::Error::NotEmpty.into());
     }
-    index.import(&rows, &lost).await?;
+    let hashes = export.hashes.clone().into_iter().collect();
+    index.import(&rows, &lost, &hashes).await?;
     accounts.restore(export.accounts.clone())?;
     config.restore_from(&export.config)?;
     Ok(())
@@ -237,8 +255,12 @@ mod tests {
         p.config.set(None, 2).unwrap();
         p.config.set(Some("Docs"), 3).unwrap();
         p.config.set_large_upload_bytes(5_000_000_000).unwrap();
+        let hash = "a".repeat(64);
         for acct in [&a.id, &b.id] {
-            p.index.mark_pending("Pics/a.jpg", 100, acct).await.unwrap();
+            p.index
+                .mark_pending_hashed("Pics/a.jpg", 100, acct, Some(&hash))
+                .await
+                .unwrap();
             p.index.mark_done("Pics/a.jpg", acct).await.unwrap();
         }
         // Unfinished, and a lost file.
@@ -287,6 +309,11 @@ mod tests {
         assert_eq!(
             fresh.index.lost("").await.unwrap(),
             src.index.lost("").await.unwrap()
+        );
+        assert_eq!(
+            fresh.index.hashes("").await.unwrap().get("Pics/a.jpg"),
+            Some(&"a".repeat(64)),
+            "the hash travels with the backup"
         );
     }
 
@@ -367,6 +394,12 @@ mod tests {
         let mut e = good.clone();
         e.placements[1].size += 1; // both copies of Pics/a.jpg must agree
         cases.push(("size disagreement", e));
+        let mut e = good.clone();
+        e.hashes.insert("Pics/a.jpg".into(), "not-a-hash".into());
+        cases.push(("malformed hash", e));
+        let mut e = good.clone();
+        e.hashes.insert("ghost.bin".into(), "b".repeat(64));
+        cases.push(("hash for an unknown file", e));
         let mut e = good.clone();
         e.format = 99;
         cases.push(("future format", e));

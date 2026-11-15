@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use turso::{Builder, Connection, params};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -61,6 +61,9 @@ pub struct IndexedFile {
     pub size: u64,
     /// Ids of the accounts holding a confirmed copy.
     pub accounts: Vec<String>,
+    /// BLAKE3 of the file as it was sent, when it is known. Older entries and
+    /// imported ones may have none.
+    pub blake3: Option<String>,
 }
 
 /// One row of the placements table, whatever its state.
@@ -192,6 +195,16 @@ impl Index {
                 )
                 .await?;
         }
+        if version < 3 {
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS hashes (
+                         path TEXT PRIMARY KEY NOT NULL,
+                         blake3 TEXT NOT NULL
+                     );",
+                )
+                .await?;
+        }
         if version < SCHEMA_VERSION {
             // Every step above is `IF NOT EXISTS`, so a crash before this line
             // only repeats harmless work on the next start.
@@ -224,6 +237,18 @@ impl Index {
 
     /// Records the intent to upload `path` to `account_id`, before the upload.
     pub async fn mark_pending(&self, path: &str, size: u64, account_id: &str) -> Result<(), Error> {
+        self.mark_pending_hashed(path, size, account_id, None).await
+    }
+
+    /// [`mark_pending`](Self::mark_pending) that also records the file's
+    /// BLAKE3. A `None` keeps whatever hash is already recorded.
+    pub async fn mark_pending_hashed(
+        &self,
+        path: &str,
+        size: u64,
+        account_id: &str,
+        blake3: Option<&str>,
+    ) -> Result<(), Error> {
         let size = i64::try_from(size)
             .map_err(|_| Error::Corrupt(format!("{path}: size {size} does not fit the index")))?;
         self.atomic(async |conn| {
@@ -239,6 +264,14 @@ impl Index {
                 params![path, account_id, State::Pending.as_str()],
             )
             .await?;
+            if let Some(hash) = blake3 {
+                conn.execute(
+                    "INSERT INTO hashes (path, blake3) VALUES (?1, ?2)
+                     ON CONFLICT(path) DO UPDATE SET blake3 = excluded.blake3",
+                    params![path, hash],
+                )
+                .await?;
+            }
             Ok(())
         })
         .await
@@ -287,10 +320,43 @@ impl Index {
                     path,
                     size,
                     accounts: vec![account],
+                    blake3: None,
                 }),
             }
         }
+        drop(rows);
+        let hashes = self.hashes_locked(prefix).await?;
+        for file in &mut files {
+            file.blake3 = hashes.get(&file.path).cloned();
+        }
         Ok(files)
+    }
+
+    /// Recorded hashes of the files under `prefix`, by path.
+    pub async fn hashes(
+        &self,
+        prefix: &str,
+    ) -> Result<std::collections::HashMap<String, String>, Error> {
+        let _turn = self.gate.lock().await;
+        self.hashes_locked(prefix).await
+    }
+
+    async fn hashes_locked(
+        &self,
+        prefix: &str,
+    ) -> Result<std::collections::HashMap<String, String>, Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path, blake3 FROM hashes WHERE substr(path, 1, length(?1)) = ?1",
+                params![prefix],
+            )
+            .await?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            out.insert(row.get::<String>(0)?, row.get::<String>(1)?);
+        }
+        Ok(out)
     }
 
     /// Every placement (pending and done) whose path starts with `prefix`.
@@ -380,6 +446,14 @@ impl Index {
                 params![path],
             )
             .await?;
+            // A hash is only worth keeping while the file is stored or lost.
+            conn.execute(
+                "DELETE FROM hashes WHERE path = ?1
+                 AND NOT EXISTS (SELECT 1 FROM items WHERE items.path = ?1)
+                 AND NOT EXISTS (SELECT 1 FROM lost WHERE lost.path = ?1)",
+                params![path],
+            )
+            .await?;
             Ok(())
         })
         .await
@@ -406,7 +480,12 @@ impl Index {
     }
 
     /// Loads exported rows into an **empty** index, all or nothing.
-    pub async fn import(&self, rows: &[Placement], lost: &[LostFile]) -> Result<(), Error> {
+    pub async fn import(
+        &self,
+        rows: &[Placement],
+        lost: &[LostFile],
+        hashes: &std::collections::HashMap<String, String>,
+    ) -> Result<(), Error> {
         self.atomic(async |conn| {
             let mut found = conn
                 .query(
@@ -440,6 +519,13 @@ impl Index {
                         row.account_id.as_str(),
                         row.state.as_str()
                     ],
+                )
+                .await?;
+            }
+            for (path, hash) in hashes {
+                conn.execute(
+                    "INSERT INTO hashes (path, blake3) VALUES (?1, ?2)",
+                    params![path.as_str(), hash.as_str()],
                 )
                 .await?;
             }
@@ -502,6 +588,7 @@ mod tests {
                 path: "Pics/a.bin".into(),
                 size: 60,
                 accounts: vec!["acct1".into()],
+                blake3: None,
             }]
         );
     }
@@ -691,5 +778,35 @@ mod tests {
             .unwrap();
         assert!(matches!(index.list("").await, Err(Error::Corrupt(_))));
         assert!(matches!(index.placements("").await, Err(Error::Corrupt(_))));
+    }
+
+    #[tokio::test]
+    async fn a_hash_is_kept_listed_and_cleaned_up_with_the_file() {
+        let index = Index::open_memory().await.unwrap();
+        let hash = "c".repeat(64);
+
+        index
+            .mark_pending_hashed("f", 5, "a", Some(&hash))
+            .await
+            .unwrap();
+        index.mark_done("f", "a").await.unwrap();
+        // A second copy recorded without a hash must not erase the hash.
+        index.mark_pending("f", 5, "b").await.unwrap();
+        index.mark_done("f", "b").await.unwrap();
+        let files = index.list("").await.unwrap();
+        assert_eq!(files[0].blake3.as_deref(), Some(hash.as_str()));
+
+        // Losing every copy keeps the hash with the lost record.
+        index.remove_placement("f", "a").await.unwrap();
+        index.remove_placement("f", "b").await.unwrap();
+        assert_eq!(index.hashes("").await.unwrap().len(), 1);
+
+        // An upload that never finished leaves no hash behind.
+        index
+            .mark_pending_hashed("g", 1, "a", Some(&hash))
+            .await
+            .unwrap();
+        index.remove_placement("g", "a").await.unwrap();
+        assert!(!index.hashes("").await.unwrap().contains_key("g"));
     }
 }

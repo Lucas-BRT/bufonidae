@@ -8,6 +8,7 @@ pub mod config;
 pub mod export;
 pub(crate) mod fsutil;
 pub mod get;
+pub mod hashing;
 pub mod index;
 pub mod manager;
 pub mod placement;

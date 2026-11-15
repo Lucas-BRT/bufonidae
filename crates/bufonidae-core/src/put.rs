@@ -29,6 +29,15 @@ pub enum Error {
     Index(#[from] index::Error),
     #[error("account {0:?} was given twice; each copy must go to a different account")]
     DuplicateAccount(String),
+    #[error(
+        "{first} and {second} would both be stored as {rel:?}; rename one or store them \
+         separately"
+    )]
+    Collision {
+        rel: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
 }
 
 /// The files under a folder of one account.
@@ -290,13 +299,17 @@ pub struct Report {
     pub no_room: Vec<String>,
     /// `(rel path, reason)`
     pub failed: Vec<(String, String)>,
+    /// A different file is already stored under this name (another size, or
+    /// the name exists twice): left alone, never overwritten.
+    /// `(rel path, reason)`
+    pub differs: Vec<(String, String)>,
     pub skipped: Vec<PathBuf>,
 }
 
 impl Report {
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.no_room.is_empty() && self.failed.is_empty()
+        self.no_room.is_empty() && self.failed.is_empty() && self.differs.is_empty()
     }
 }
 
@@ -304,6 +317,19 @@ fn changed_since_scan(file: &LocalFile) -> bool {
     fs::metadata(&file.abs)
         .and_then(|m| m.modified().map(|t| (m.len(), t)))
         .map_or(true, |(len, time)| len != file.size || time != file.mtime)
+}
+
+fn fail(
+    report: &mut Report,
+    observer: &mut (dyn FnMut(Progress) + Send),
+    rel: &str,
+    reason: String,
+) {
+    observer(Progress::Failed {
+        rel: rel.to_owned(),
+        reason: reason.clone(),
+    });
+    report.failed.push((rel.to_owned(), reason));
 }
 
 /// A step of a running [`put_observed`], for progress displays.
@@ -371,13 +397,40 @@ pub async fn put_observed<R: RemoteFs>(
         ..Report::default()
     };
 
-    // Never create a duplicate: a file already on any account is left alone.
-    let mut present = HashSet::new();
+    // Two different local files must not end up with the same stored name,
+    // and the same file chosen twice (say, a folder and a file inside it) is
+    // stored once.
+    let mut chosen: HashMap<String, PathBuf> = HashMap::new();
+    let mut files = Vec::with_capacity(scan.files.len());
+    for file in scan.files {
+        match chosen.get(&file.rel) {
+            None => {
+                chosen.insert(file.rel.clone(), file.abs.clone());
+                files.push(file);
+            }
+            Some(first) if *first == file.abs => {}
+            Some(first) => {
+                return Err(Error::Collision {
+                    rel: file.rel,
+                    first: first.clone(),
+                    second: file.abs,
+                });
+            }
+        }
+    }
+
+    // What is already stored under each name, on any account.
+    let mut present: HashMap<String, (Vec<u64>, bool)> = HashMap::new();
     let mut spaces = Vec::new();
     for (i, account) in accounts.iter().enumerate() {
-        // An ambiguous (duplicated) name counts as present: it must not be
-        // uploaded over.
-        present.extend(remote.list_files(account, &dest).await?.paths().cloned());
+        let listing = remote.list_files(account, &dest).await?;
+        for (path, size) in listing.files {
+            present.entry(path).or_default().0.push(size);
+        }
+        // A duplicated name is ambiguous: it must not be uploaded over.
+        for path in listing.duplicates {
+            present.entry(path).or_default().1 = true;
+        }
         let free = remote.free_space(account).await?.ok_or_else(|| {
             Error::Remote(format!(
                 "account {:?} does not report its free space",
@@ -390,11 +443,30 @@ pub async fn put_observed<R: RemoteFs>(
         });
     }
 
-    let (todo, there): (Vec<_>, Vec<_>) = scan
-        .files
-        .into_iter()
-        .partition(|f| !present.contains(&f.rel));
-    report.already_there = there.into_iter().map(|f| f.rel).collect();
+    let mut todo = Vec::new();
+    for file in files {
+        match present.get(&file.rel) {
+            None => todo.push(file),
+            Some((sizes, false)) if sizes.iter().all(|&s| s == file.size) => {
+                report.already_there.push(file.rel);
+            }
+            Some((_, true)) => report.differs.push((
+                file.rel,
+                "the name exists more than once on an account, so it is left alone".to_owned(),
+            )),
+            Some((sizes, false)) => {
+                let found: Vec<String> = sizes.iter().map(u64::to_string).collect();
+                report.differs.push((
+                    file.rel,
+                    format!(
+                        "a different file is already stored there ({} bytes, this one is {})",
+                        found.join("/"),
+                        file.size
+                    ),
+                ));
+            }
+        }
+    }
 
     let wanted: Vec<Wanted> = todo
         .iter()
@@ -435,13 +507,47 @@ pub async fn put_observed<R: RemoteFs>(
             continue;
         };
         let remote_path = join(&dest, &file.rel);
+        // The hash is of the file as it is about to be sent; it is what later
+        // reads are checked against.
+        let abs = file.abs.clone();
+        let hash = match tokio::task::spawn_blocking(move || crate::hashing::hash_file(&abs)).await
+        {
+            Ok(Ok(hash)) => hash,
+            Ok(Err(e)) => {
+                fail(
+                    &mut report,
+                    observer,
+                    &file.rel,
+                    format!("could not read it: {e}"),
+                );
+                continue;
+            }
+            Err(e) => {
+                fail(
+                    &mut report,
+                    observer,
+                    &file.rel,
+                    format!("hashing failed: {e}"),
+                );
+                continue;
+            }
+        };
         for AccountId(slot) in targets {
             let account = &accounts[slot as usize];
             // Write-ahead: a crash after this line leaves a `pending` trace.
             index
-                .mark_pending(&remote_path, file.size, &account.id)
+                .mark_pending_hashed(&remote_path, file.size, &account.id, Some(&hash))
                 .await?;
-            match remote.upload(account, parent, name, &remote_path).await {
+            let uploaded = remote.upload(account, parent, name, &remote_path).await;
+            // A file edited while it was being sent may not match its hash:
+            // the copy is not trustworthy, so it is left `pending`.
+            let uploaded = match uploaded {
+                Ok(()) if changed_since_scan(file) => Err(Error::Remote(
+                    "the file changed while it was being uploaded".to_owned(),
+                )),
+                other => other,
+            };
+            match uploaded {
                 Ok(()) => {
                     index.mark_done(&remote_path, &account.id).await?;
                     report
@@ -479,8 +585,11 @@ mod tests {
 
     struct Fake {
         fail_uploads: bool,
+        /// Edits the source file while "uploading" it.
+        mutate_source: bool,
         free: HashMap<String, u64>,
-        existing: HashMap<String, HashSet<String>>,
+        /// Per account: stored path to size.
+        existing: HashMap<String, HashMap<String, u64>>,
         uploads: RefCell<Vec<(String, String)>>,
     }
 
@@ -494,15 +603,29 @@ mod tests {
                     .get(&a.label)
                     .into_iter()
                     .flatten()
-                    .map(|p| (p.clone(), 0)),
+                    .map(|(p, s)| (p.clone(), *s)),
             ))
         }
         async fn download(&self, _: &Account, _: &str, _: &Path, _: &str) -> Result<(), Error> {
             Err(Error::Remote("not used by put".into()))
         }
-        async fn upload(&self, a: &Account, _: &Path, _: &str, to: &str) -> Result<(), Error> {
+        async fn upload(
+            &self,
+            a: &Account,
+            parent: &Path,
+            name: &str,
+            to: &str,
+        ) -> Result<(), Error> {
             if self.fail_uploads {
                 return Err(Error::Remote("boom".into()));
+            }
+            if self.mutate_source {
+                use std::io::Write as _;
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(parent.join(name))
+                    .unwrap();
+                f.write_all(b"!").unwrap();
             }
             self.uploads
                 .borrow_mut()
@@ -522,6 +645,7 @@ mod tests {
     fn fake(free: &[(&str, u64)]) -> Fake {
         Fake {
             fail_uploads: false,
+            mutate_source: false,
             free: free.iter().map(|(l, f)| ((*l).to_owned(), *f)).collect(),
             existing: HashMap::new(),
             uploads: RefCell::default(),
@@ -586,9 +710,11 @@ mod tests {
     async fn skips_files_present_on_any_account_and_reports_no_room() {
         let dir = tree();
         let mut remote = fake(&[("one", 55), ("two", 10)]);
-        remote
-            .existing
-            .insert("two".into(), HashSet::from(["photos/sub/b.bin".to_owned()]));
+        // b.bin is 50 bytes locally; the same size on the account = same file.
+        remote.existing.insert(
+            "two".into(),
+            HashMap::from([("photos/sub/b.bin".to_owned(), 50)]),
+        );
         let index = Index::open_memory().await.unwrap();
         let report = put(
             &remote,
@@ -793,5 +919,211 @@ mod tests {
             3,
             "ambiguous names still count as present"
         );
+    }
+
+    async fn put_with(
+        remote: &Fake,
+        index: &Index,
+        sources: &[PathBuf],
+        accounts: &[Account],
+    ) -> Result<Report, Error> {
+        put(
+            remote,
+            index,
+            accounts,
+            &MostFreeSpace::default(),
+            &Config::default(),
+            sources,
+            "Pics",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn two_different_files_with_one_stored_name_are_refused_before_anything_happens() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["x", "y"] {
+            fs::create_dir(dir.path().join(d)).unwrap();
+            fs::write(dir.path().join(d).join("same.txt"), d).unwrap();
+        }
+        // Selected as files, both would be stored as "same.txt".
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let result = put_with(
+            &remote,
+            &index,
+            &[dir.path().join("x/same.txt"), dir.path().join("y/same.txt")],
+            &[account("one")],
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Collision { .. })), "{result:?}");
+        assert!(remote.uploads.borrow().is_empty());
+        assert!(index.placements("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_same_file_chosen_twice_is_stored_once() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let report = put_with(
+            &remote,
+            &index,
+            &[
+                dir.path().join("photos"),
+                dir.path().join("photos/a.bin"), // already inside the folder
+            ],
+            &[account("one")],
+        )
+        .await;
+        // The file appears as "photos/a.bin" from the folder but as "a.bin"
+        // when chosen alone, so these are two names, not one: both are stored.
+        let report = report.unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.uploaded.len(), 3);
+
+        // Chosen twice under the same name: stored once.
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let file = dir.path().join("photos/a.bin");
+        let report = put_with(&remote, &index, &[file.clone(), file], &[account("one")])
+            .await
+            .unwrap();
+        assert_eq!(report.uploaded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_different_file_already_stored_under_the_name_is_reported_not_overwritten() {
+        let dir = tree();
+        let mut remote = fake(&[("one", 1000)]);
+        // a.bin is 60 bytes locally but 7 on the account; b.bin matches.
+        remote.existing.insert(
+            "one".into(),
+            HashMap::from([
+                ("photos/a.bin".to_owned(), 7),
+                ("photos/sub/b.bin".to_owned(), 50),
+            ]),
+        );
+        let index = Index::open_memory().await.unwrap();
+        let report = put_with(
+            &remote,
+            &index,
+            &[dir.path().join("photos")],
+            &[account("one")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.already_there, ["photos/sub/b.bin"]);
+        assert_eq!(report.differs.len(), 1);
+        assert_eq!(report.differs[0].0, "photos/a.bin");
+        assert!(report.differs[0].1.contains("7 bytes"));
+        assert!(
+            !report.is_complete(),
+            "a skipped different file is not success"
+        );
+        assert!(
+            remote.uploads.borrow().is_empty(),
+            "nothing was overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_remote_name_is_left_alone() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        // Two objects share the name on the account: simulate through a fake
+        // that reports a duplicate.
+        struct Twin(Fake);
+        impl RemoteFs for Twin {
+            async fn free_space(&self, a: &Account) -> Result<Option<u64>, Error> {
+                self.0.free_space(a).await
+            }
+            async fn list_files(&self, _: &Account, _: &str) -> Result<Listing, Error> {
+                Ok(Listing::from_entries([
+                    ("photos/a.bin".to_owned(), 60),
+                    ("photos/a.bin".to_owned(), 61),
+                ]))
+            }
+            async fn download(&self, a: &Account, r: &str, d: &Path, n: &str) -> Result<(), Error> {
+                self.0.download(a, r, d, n).await
+            }
+            async fn upload(&self, a: &Account, p: &Path, n: &str, t: &str) -> Result<(), Error> {
+                self.0.upload(a, p, n, t).await
+            }
+        }
+        let twin = Twin(remote);
+        let report = put(
+            &twin,
+            &index,
+            &[account("one")],
+            &MostFreeSpace::default(),
+            &Config::default(),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.differs.len(), 1);
+        assert!(report.differs[0].1.contains("more than once"));
+        assert!(
+            twin.0
+                .uploads
+                .borrow()
+                .iter()
+                .all(|(_, to)| !to.ends_with("a.bin"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hash_of_what_was_sent_is_recorded() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        put_with(
+            &remote,
+            &index,
+            &[dir.path().join("photos")],
+            &[account("one")],
+        )
+        .await
+        .unwrap();
+        let files = index.list("Pics/").await.unwrap();
+        let a = files
+            .iter()
+            .find(|f| f.path == "Pics/photos/a.bin")
+            .unwrap();
+        assert_eq!(
+            a.blake3.as_deref(),
+            Some(blake3::hash(&[0u8; 60]).to_hex().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_edited_during_the_upload_is_not_marked_done() {
+        let dir = tree();
+        let mut remote = fake(&[("one", 1000)]);
+        remote.mutate_source = true;
+        let index = Index::open_memory().await.unwrap();
+        let report = put_with(
+            &remote,
+            &index,
+            &[dir.path().join("photos")],
+            &[account("one")],
+        )
+        .await
+        .unwrap();
+        assert!(report.uploaded.is_empty());
+        assert_eq!(report.failed.len(), 2);
+        assert!(
+            report.failed[0]
+                .1
+                .contains("changed while it was being uploaded")
+        );
+        assert!(
+            index.list("").await.unwrap().is_empty(),
+            "nothing is 'done'"
+        );
+        assert_eq!(index.pending().await.unwrap().len(), 2);
     }
 }

@@ -446,6 +446,13 @@ impl Render for StoreForm {
                         muted,
                     );
                 }
+                for (rel, reason) in report.differs.iter().take(MAX_LISTED) {
+                    push(
+                        IconName::TriangleAlert,
+                        format!("{rel}: not stored. {reason}"),
+                        danger,
+                    );
+                }
                 for rel in report.no_room.iter().take(MAX_LISTED) {
                     push(
                         IconName::TriangleAlert,
@@ -459,7 +466,8 @@ impl Render for StoreForm {
                     push(IconName::CircleX, format!("{rel}: {reason}"), danger);
                 }
                 let more = (report.no_room.len().saturating_sub(MAX_LISTED))
-                    + (report.failed.len().saturating_sub(MAX_LISTED));
+                    + (report.failed.len().saturating_sub(MAX_LISTED))
+                    + (report.differs.len().saturating_sub(MAX_LISTED));
                 if more > 0 {
                     push(IconName::Info, format!("and {more} more problems"), muted);
                 }

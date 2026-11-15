@@ -442,6 +442,9 @@ fn print_report(report: &put::Report) {
     for path in &report.skipped {
         println!("skipped   {} (symlink or unsupported name)", path.display());
     }
+    for (rel, reason) in &report.differs {
+        eprintln!("DIFFERS   {rel}: {reason}");
+    }
     for rel in &report.no_room {
         eprintln!("NO ROOM   {rel} (not enough accounts or space for every copy)");
     }
