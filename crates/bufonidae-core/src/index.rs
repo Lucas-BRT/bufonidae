@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use turso::{Builder, Connection, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -27,6 +27,8 @@ pub enum Error {
     },
     #[error("index schema version {found} is newer than this build supports ({SCHEMA_VERSION})")]
     TooNew { found: i64 },
+    #[error("index data is invalid: {0}")]
+    Corrupt(String),
     #[error("could not determine the data directory")]
     NoDataDir,
     #[error(
@@ -77,14 +79,32 @@ pub struct PendingPlacement {
     pub account_id: String,
 }
 
+/// A file that was stored and whose every copy has since disappeared. Kept so
+/// that `repair` can still say it is lost, instead of the file vanishing from
+/// the record as if it had never existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostFile {
+    pub path: String,
+    pub size: u64,
+}
+
 pub struct Index {
     conn: Connection,
+    /// One connection serves every task, so an explicit transaction must not
+    /// be interleaved with another task's statements.
+    gate: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Index {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Index(..)")
     }
+}
+
+/// A stored size must be a non-negative integer; anything else means the
+/// database is damaged and must not be quietly read as `0`.
+fn to_size(path: &str, size: i64) -> Result<u64, Error> {
+    u64::try_from(size).map_err(|_| Error::Corrupt(format!("{path}: negative size {size}")))
 }
 
 impl Index {
@@ -128,7 +148,10 @@ impl Index {
             }
         })?;
         let conn = db.connect()?;
-        let index = Self { conn };
+        let index = Self {
+            conn,
+            gate: tokio::sync::Mutex::new(()),
+        };
         index.migrate().await?;
         Ok(index)
     }
@@ -158,6 +181,20 @@ impl Index {
                      );",
                 )
                 .await?;
+        }
+        if version < 2 {
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS lost (
+                         path TEXT PRIMARY KEY NOT NULL,
+                         size INTEGER NOT NULL
+                     );",
+                )
+                .await?;
+        }
+        if version < SCHEMA_VERSION {
+            // Every step above is `IF NOT EXISTS`, so a crash before this line
+            // only repeats harmless work on the next start.
             self.conn
                 .pragma_update("user_version", SCHEMA_VERSION)
                 .await?;
@@ -165,39 +202,67 @@ impl Index {
         Ok(())
     }
 
+    /// Runs `work` in one transaction: all of its statements apply, or none.
+    pub(crate) async fn atomic<T>(
+        &self,
+        work: impl AsyncFnOnce(&Connection) -> Result<T, turso::Error>,
+    ) -> Result<T, Error> {
+        let _turn = self.gate.lock().await;
+        self.conn.execute("BEGIN", ()).await?;
+        match work(&self.conn).await {
+            Ok(value) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                // The original error matters more than a failed rollback.
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(error.into())
+            }
+        }
+    }
+
     /// Records the intent to upload `path` to `account_id`, before the upload.
     pub async fn mark_pending(&self, path: &str, size: u64, account_id: &str) -> Result<(), Error> {
-        let size = i64::try_from(size).unwrap_or(i64::MAX);
-        self.conn
-            .execute(
+        let size = i64::try_from(size)
+            .map_err(|_| Error::Corrupt(format!("{path}: size {size} does not fit the index")))?;
+        self.atomic(async |conn| {
+            conn.execute(
                 "INSERT INTO items (path, size) VALUES (?1, ?2)
                  ON CONFLICT(path) DO UPDATE SET size = excluded.size",
                 params![path, size],
             )
             .await?;
-        self.conn
-            .execute(
+            conn.execute(
                 "INSERT INTO placements (path, account_id, state) VALUES (?1, ?2, ?3)
                  ON CONFLICT(path, account_id) DO UPDATE SET state = excluded.state",
                 params![path, account_id, State::Pending.as_str()],
             )
             .await?;
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Confirms the upload started with [`mark_pending`](Self::mark_pending).
     pub async fn mark_done(&self, path: &str, account_id: &str) -> Result<(), Error> {
-        self.conn
-            .execute(
+        self.atomic(async |conn| {
+            conn.execute(
                 "UPDATE placements SET state = ?3 WHERE path = ?1 AND account_id = ?2",
                 params![path, account_id, State::Done.as_str()],
             )
             .await?;
-        Ok(())
+            // A copy exists again: the file is no longer lost.
+            conn.execute("DELETE FROM lost WHERE path = ?1", params![path])
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Files whose path starts with `prefix`, with their confirmed accounts.
     pub async fn list(&self, prefix: &str) -> Result<Vec<IndexedFile>, Error> {
+        let _turn = self.gate.lock().await;
         // `substr` compares literally; `LIKE` would treat `%` and `_` in the
         // prefix as wildcards.
         let mut rows = self
@@ -215,11 +280,12 @@ impl Index {
             let path: String = row.get(0)?;
             let size: i64 = row.get(1)?;
             let account: String = row.get(2)?;
+            let size = to_size(&path, size)?;
             match files.last_mut() {
                 Some(last) if last.path == path => last.accounts.push(account),
                 _ => files.push(IndexedFile {
                     path,
-                    size: u64::try_from(size).unwrap_or(0),
+                    size,
                     accounts: vec![account],
                 }),
             }
@@ -229,6 +295,7 @@ impl Index {
 
     /// Every placement (pending and done) whose path starts with `prefix`.
     pub async fn placements(&self, prefix: &str) -> Result<Vec<Placement>, Error> {
+        let _turn = self.gate.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -241,17 +308,18 @@ impl Index {
             .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            let size: i64 = row.get(1)?;
-            let state: String = row.get(3)?;
+            let path: String = row.get(0)?;
+            let size = to_size(&path, row.get(1)?)?;
+            let state = match row.get::<String>(3)?.as_str() {
+                "done" => State::Done,
+                "pending" => State::Pending,
+                other => return Err(Error::Corrupt(format!("{path}: unknown state {other:?}"))),
+            };
             out.push(Placement {
-                path: row.get(0)?,
-                size: u64::try_from(size).unwrap_or(0),
+                size,
+                path,
                 account_id: row.get(2)?,
-                state: if state == "done" {
-                    State::Done
-                } else {
-                    State::Pending
-                },
+                state,
             });
         }
         Ok(out)
@@ -260,24 +328,86 @@ impl Index {
     /// Forgets the placement of `path` on `account_id`, and the file itself
     /// when no placement is left. Touches the index only, never the remote.
     pub async fn remove_placement(&self, path: &str, account_id: &str) -> Result<(), Error> {
-        self.conn
-            .execute(
+        self.atomic(async |conn| {
+            // What was there before: a confirmed copy disappearing is a loss,
+            // an upload that never finished is not.
+            let mut rows = conn
+                .query(
+                    "SELECT p.state, i.size FROM placements p JOIN items i ON i.path = p.path
+                     WHERE p.path = ?1 AND p.account_id = ?2",
+                    params![path, account_id],
+                )
+                .await?;
+            let removed = match rows.next().await? {
+                Some(row) => Some((row.get::<String>(0)?, row.get::<i64>(1)?)),
+                None => None,
+            };
+            drop(rows);
+
+            conn.execute(
                 "DELETE FROM placements WHERE path = ?1 AND account_id = ?2",
                 params![path, account_id],
             )
             .await?;
-        self.conn
-            .execute(
+
+            if let Some((state, size)) = removed
+                && state == State::Done.as_str()
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM placements WHERE path = ?1 AND state = 'done'",
+                        params![path],
+                    )
+                    .await?;
+                let left: i64 = match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                };
+                drop(rows);
+                if left == 0 {
+                    conn.execute(
+                        "INSERT INTO lost (path, size) VALUES (?1, ?2)
+                         ON CONFLICT(path) DO UPDATE SET size = excluded.size",
+                        params![path, size],
+                    )
+                    .await?;
+                }
+            }
+
+            conn.execute(
                 "DELETE FROM items WHERE path = ?1
                  AND NOT EXISTS (SELECT 1 FROM placements WHERE placements.path = ?1)",
                 params![path],
             )
             .await?;
-        Ok(())
+            Ok(())
+        })
+        .await
+    }
+
+    /// Files under `prefix` that were stored and have lost every copy.
+    pub async fn lost(&self, prefix: &str) -> Result<Vec<LostFile>, Error> {
+        let _turn = self.gate.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT path, size FROM lost
+                 WHERE substr(path, 1, length(?1)) = ?1 ORDER BY path",
+                params![prefix],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let path: String = row.get(0)?;
+            let size = to_size(&path, row.get(1)?)?;
+            out.push(LostFile { path, size });
+        }
+        Ok(out)
     }
 
     /// Uploads that were started and never confirmed.
     pub async fn pending(&self) -> Result<Vec<PendingPlacement>, Error> {
+        let _turn = self.gate.lock().await;
         let mut rows = self
             .conn
             .query(
@@ -406,5 +536,108 @@ mod tests {
         lines.for_each(drop);
         child.wait().unwrap();
         assert!(matches!(result, Err(Error::InUse)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_transaction_leaves_nothing_behind() {
+        let index = Index::open_memory().await.unwrap();
+        let result: Result<(), Error> = index
+            .atomic(async |conn| {
+                conn.execute("INSERT INTO items (path, size) VALUES ('half', 1)", ())
+                    .await?;
+                // The second statement of the pair fails (no such table).
+                conn.execute("INSERT INTO no_such_table VALUES (1)", ())
+                    .await?;
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err());
+        // The first insert was rolled back, and the index is still usable.
+        assert!(index.placements("").await.unwrap().is_empty());
+        index.mark_pending("ok", 1, "a").await.unwrap();
+        assert_eq!(index.placements("").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn losing_every_confirmed_copy_is_remembered_but_a_never_finished_upload_is_not() {
+        let index = Index::open_memory().await.unwrap();
+        index.mark_pending("kept", 10, "a").await.unwrap();
+        index.mark_done("kept", "a").await.unwrap();
+        index.mark_pending("kept", 10, "b").await.unwrap();
+        index.mark_done("kept", "b").await.unwrap();
+        index.mark_pending("never", 7, "a").await.unwrap();
+
+        // One of two copies gone: still stored, not lost.
+        index.remove_placement("kept", "a").await.unwrap();
+        assert!(index.lost("").await.unwrap().is_empty());
+        // The last copy gone: lost, with its size, and gone from the listing.
+        index.remove_placement("kept", "b").await.unwrap();
+        assert_eq!(
+            index.lost("").await.unwrap(),
+            [LostFile {
+                path: "kept".into(),
+                size: 10
+            }]
+        );
+        assert!(index.list("").await.unwrap().is_empty());
+        // An upload that never completed leaves no trace.
+        index.remove_placement("never", "a").await.unwrap();
+        assert_eq!(index.lost("").await.unwrap().len(), 1);
+
+        // A copy turning up again clears the loss.
+        index.mark_pending("kept", 10, "c").await.unwrap();
+        index.mark_done("kept", "c").await.unwrap();
+        assert!(index.lost("").await.unwrap().is_empty());
+        assert_eq!(index.list("").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_version_one_database_is_migrated_without_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            // The schema exactly as version 1 created it.
+            let db = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (path TEXT PRIMARY KEY NOT NULL, size INTEGER NOT NULL);
+                 CREATE TABLE placements (
+                     path TEXT NOT NULL, account_id TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK (state IN ('pending', 'done')),
+                     PRIMARY KEY (path, account_id));
+                 INSERT INTO items VALUES ('old.bin', 42);
+                 INSERT INTO placements VALUES ('old.bin', 'a', 'done');",
+            )
+            .await
+            .unwrap();
+            conn.pragma_update("user_version", 1).await.unwrap();
+        }
+        let index = Index::open(&path).await.unwrap();
+        let files = index.list("").await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 42);
+        // The new table is there and works.
+        index.remove_placement("old.bin", "a").await.unwrap();
+        assert_eq!(index.lost("").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_size_is_an_error_not_zero() {
+        let index = Index::open_memory().await.unwrap();
+        index
+            .atomic(async |conn| {
+                conn.execute("INSERT INTO items VALUES ('bad', -5)", ())
+                    .await?;
+                conn.execute("INSERT INTO placements VALUES ('bad', 'a', 'done')", ())
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(index.list("").await, Err(Error::Corrupt(_))));
+        assert!(matches!(index.placements("").await, Err(Error::Corrupt(_))));
     }
 }

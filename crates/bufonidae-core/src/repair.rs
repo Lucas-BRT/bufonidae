@@ -64,6 +64,18 @@ pub async fn find_gaps(
             });
         }
     }
+    // Files whose every copy is gone no longer appear in `list`, but they are
+    // exactly what the user most needs to hear about.
+    for lost in index.lost(prefix).await? {
+        if is_under(&lost.path, prefix) {
+            gaps.push(Gap {
+                wanted: config.copies_for(&lost.path),
+                path: lost.path,
+                size: lost.size,
+                holders: Vec::new(),
+            });
+        }
+    }
     Ok(gaps)
 }
 
@@ -395,5 +407,27 @@ mod tests {
         .unwrap();
         assert!(r.repaired.is_empty() && r.is_complete());
         assert!(fake.uploads.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_lost_every_copy_is_reported_lost_not_forgotten() {
+        let (index, fake) = setup(&[("x.bin", 10, &["a"])]).await;
+        // What `reconcile --apply` does when the only copy is gone remotely.
+        index.remove_placement("x.bin", "a").await.unwrap();
+        assert!(index.list("").await.unwrap().is_empty());
+
+        let accounts = [account("a"), account("b")];
+        let r = repair(
+            &fake,
+            &index,
+            &accounts,
+            &MostFreeSpace::default(),
+            &mirror(1),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.lost, ["x.bin"]);
+        assert!(!r.is_complete(), "a lost file must not read as success");
     }
 }
