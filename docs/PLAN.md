@@ -1,127 +1,136 @@
-# Bufonidae — plano
+# Bufonidae — plan
 
-App desktop Linux (Rust) que agrega N contas Mega.nz num diretório lógico único e distribui arquivos entre elas, usando `rclone` como motor de transferência.
+Linux desktop app (Rust) that aggregates N Mega.nz accounts into a single logical directory and distributes files among them, using `rclone` as the transfer engine.
 
-## 1. Arquitetura
+## 0. Repository conventions
+
+- **Everything in the repository is written in English**: code, identifiers, comments, commit messages, documentation, issue/PR text, UI strings (i18n can come later, with English as the source language).
+- MIT license. Private repository for now.
+
+## 1. Architecture
 
 ```
-bufonidae/                      (Cargo workspace, edition 2024, toolchain pinada)
+bufonidae/                      (Cargo workspace, edition 2024, pinned toolchain)
 ├─ crates/
-│  ├─ bufonidae-core/           placement, índice, journal, quotas, políticas (sem I/O de UI)
-│  ├─ bufonidae-rclone/         cliente do `rclone rcd` (JSON-RPC/HTTP), supervisor do processo
-│  └─ bufonidae-cli/            binário `bufonidae` (clap), mesma core
+│  ├─ bufonidae-core/           placement, index, journal, quotas, policies (no UI I/O)
+│  ├─ bufonidae-rclone/         `rclone rcd` client (JSON-RPC/HTTP), process supervisor
+│  └─ bufonidae-cli/            `bufonidae` binary (clap), built on core
 ├─ apps/
-│  └─ desktop/                  gpui + gpui-component, mesma core
-├─ website/                     crate Rust + Topcoat (SSR), Dockerfile + compose.yml
+│  └─ desktop/                  gpui + gpui-component, built on core
+├─ website/                     Rust + Topcoat crate (SSR), Dockerfile + compose.yml
 └─ docs/
 ```
 
-Regra: core não depende de gpui nem de clap. CLI e desktop são finas; toda lógica testável vive em core.
+Rule: core depends on neither gpui nor clap. CLI and desktop stay thin; all testable logic lives in core.
 
-Fluxo: `drop` (GUI/CLI/watch folder) → **planner** (core) decide conta-destino por item → **journal** (SQLite) grava intenção → `rclone rcd` executa (`operations/copyfile`, `sync/copy`) → verificação → journal confirma → índice atualiza.
+Flow: `drop` (GUI/CLI/watch folder) → **planner** (core) picks a destination account per item → **journal** (SQLite) records the intent → `rclone rcd` executes (`operations/copyfile`, `sync/copy`) → verification → journal confirms → index updates.
 
-## 2. Problemas e soluções
+## 2. Problems and solutions
 
-| # | Problema | Solução |
-|---|----------|---------|
-| 1 | **ToS do Mega** proíbe burlar limites de quota; várias contas gratuitas podem ser banidas. | Não automatizar criação de contas. Só conectar contas que o usuário já tem. Aviso explícito no primeiro uso. Documentar no README/website. |
-| 2 | **rsync não fala Mega.** | rsync não entra no caminho Mega. Uso legítimo: staging local (`--partial --checksum`) de pasta observada → área temporária, e espelho local→local/NAS. Se não houver caso real no MVP, adiar. Dizer isso na doc, sem inflar. |
-| 3 | **Mega não tem hash/mtime utilizáveis no rclone** (backend `mega`): `--checksum` não funciona, comparação é por tamanho. | Calcular hash local (blake3) no upload e guardar no índice; verificar integridade por tamanho + hash do índice; `rclone check --size-only` como fallback. Verificar versão do rclone ao pinar. |
-| 4 | **Cota de transferência (bandwidth) por conta**, além do espaço. Download falha ao estourar. | Modelar duas cotas por conta: espaço livre (`operations/about`) e orçamento de banda estimado com janela móvel. Leitura escolhe a réplica/conta com banda sobrando; backoff em erro de quota. |
-| 5 | **Mover entre contas = download + upload** (sem move server-side entre contas). Rebalancear é caro. | Acertar o placement na primeira vez. Rebalanceamento só manual/agendado, com estimativa de custo mostrada antes. |
-| 6 | **Placement ruim**: arquivos grandes, pastas com muitos arquivos pequenos, pastas que devem ficar juntas. | Políticas plugáveis (trait `Placement`): `most-free-space` (padrão), `round-robin`, `keep-folder-together` (pasta inteira numa conta se couber), `spread` (por arquivo). Bin packing first-fit-decreasing quando o drop é um lote. Folga mínima configurável por conta (ex. 5%). |
-| 7 | **Arquivo maior que o espaço livre de qualquer conta.** | Chunking opcional: partes de N MB em contas distintas + manifesto no índice. Fase 2; MVP rejeita com erro claro. Alternativa: `rclone chunker` sobre `union` (avaliar). |
-| 8 | **Perder uma conta = perder parte dos dados** (sem redundância). | Fator de réplica por pasta (1 padrão, 2 opcional). Mostrar no UI "dados em risco" por conta. Índice exportável. |
-| 9 | **Índice diverge da realidade** (alguém mexeu pelo site do Mega, crash no meio). | Fonte da verdade = listagem remota; índice é cache. Journal write-ahead para recovery. Comando/ação `reconcile` (`operations/list` recursivo) detecta órfãos, faltantes, duplicados. |
-| 10 | **Mega permite nomes duplicados** na mesma pasta. | Planner nunca cria duplicata; reconcile sinaliza (`rclone dedupe` só com confirmação). |
-| 11 | **Rate limit / login** (muitos logins simultâneos → erros `-3`/`-9`, bloqueio temporário). | Uma instância `rcd` única gerencia as N contas; sessões reaproveitadas; semáforo de concorrência por conta e global; retry com backoff exponencial + jitter. |
-| 12 | **Credenciais**: `rclone.conf` guarda senha só ofuscada (obscure ≠ criptografia). | Segredos no Secret Service (GNOME Keyring/KWallet) via `keyring`/`oo7`. Config do rclone gerada em runtime (arquivo temp 0600 em `XDG_RUNTIME_DIR` ou `config/create` via RC) e nunca persistida com senha. 2FA: confirmar suporte na versão do rclone e expor campo no UI. |
-| 13 | **Privacidade do metadado**: índice local revela estrutura. | SQLite em `XDG_DATA_HOME`, permissão 0600; opção SQLCipher fora do MVP. Mega já é E2EE; `crypt` opcional por cima fica fora do MVP. |
-| 14 | **Dependência de binário externo** (rclone ausente/versão errada). | Detectar na inicialização (`rclone version`), versão mínima pinada, mensagem acionável. Não embutir no MVP; empacotamento (AppImage/Flatpak) pode incluir. |
-| 15 | **Processo `rcd` órfão / porta exposta.** | Subir com `--rc-addr 127.0.0.1:0` (porta efêmera) + `--rc-user/--rc-pass` aleatórios por sessão; supervisor mata no drop; `kill_on_drop`. |
-| 16 | **gpui é instável** (API muda sem semver estrito; ecossistema em fluxo). | Pin exato (rev git do zed ou versão do crates.io, confirmar o que está publicado na hora do scaffold). Camada fina de views isolada em `apps/desktop`; atualização de gpui = commit próprio. `gpui-component` para widgets (tabela, tree, input). |
-| 17 | **gpui no Linux exige libs de sistema** (Vulkan, Wayland/X11, xkbcommon, fontconfig…) e GPU. | Lista no README e no CI (apt). Verificar fallback de software rendering; documentar requisitos. |
-| 18 | **Testar sem Mega** (conta real em CI = segredo + flaky + ToS). | Contas fake = backend `local` ou `memory` do rclone com limites simulados. Trait `RemoteFs` em core, impl `rclone` e impl `fake` determinística. Testes live contra Mega só manuais/`--ignored`, fora do CI. |
-| 19 | **Operações longas na UI** (cancelar, retomar, progresso). | Fila de jobs em core com estados persistidos; progresso via `core/stats`/`job/status` do rcd; UI assina canal de eventos. Retomável após crash pelo journal. |
-| 20 | **Segurança de caminhos**: drop de symlinks, `..`, nomes inválidos, arquivos mudando durante upload. | Canonicalizar, política de symlink explícita (não seguir por padrão), snapshot de size/mtime antes e checagem depois. |
+| # | Problem | Solution |
+|---|---------|----------|
+| 1 | **Mega ToS** forbids circumventing quota limits; many free accounts may get banned. | Never automate account creation. Only connect accounts the user already owns. Explicit warning on first run. Documented in the README and website. |
+| 2 | **rsync does not speak Mega.** | rsync stays off the Mega path. Legitimate uses: local staging (`--partial --checksum`) from a watched folder, or local→local/NAS mirroring. Deferred until there is a concrete use case. Say so in the docs. |
+| 3 | **rclone's `mega` backend has no usable hashes or mtimes**: `--checksum` does not work, comparison is by size only. | Compute a local blake3 at upload time and store it in the index; verify integrity by size + indexed hash; `rclone check --size-only` as fallback. Confirm when pinning the rclone version. |
+| 4 | **Per-account transfer (bandwidth) quota**, besides storage. Downloads fail when it runs out. | Model two quotas per account: free space (`operations/about`) and an estimated bandwidth budget over a sliding window. Reads pick the replica/account with bandwidth left; backoff on quota errors. |
+| 5 | **Moving between accounts = download + upload** (no server-side cross-account move). Rebalancing is expensive. | Get placement right the first time. Rebalancing is manual/scheduled only, with a cost estimate shown first. |
+| 6 | **Bad placement**: large files, folders with many small files, folders that should stay together. | Pluggable policies (`Placement` trait): `most-free-space` (default), `round-robin`, `keep-folder-together` (whole folder on one account if it fits), `spread` (per file). First-fit-decreasing bin packing for batch drops. Configurable minimum headroom per account (e.g. 5%). Default granularity: per file, with keep-together as a per-folder option. |
+| 7 | **File larger than any account's free space.** | Optional chunking: N MB parts on distinct accounts + manifest in the index. Phase 3; the MVP rejects with a clear error. Alternative: `rclone chunker` over `union` (to evaluate). |
+| 8 | **Losing an account loses part of the data** (no redundancy). | RAID-style redundancy, optional and configurable per pool, overridable per folder (see §3). UI shows "data at risk" per account. Exportable index. |
+| 9 | **Index drifts from reality** (someone edited via Mega's site, crash mid-transfer). | Source of truth = remote listing; the index is a cache. Write-ahead journal for recovery. A `reconcile` command/action (recursive `operations/list`) finds orphans, missing items and duplicates. |
+| 10 | **Mega allows duplicate names** in the same folder. | The planner never creates duplicates; reconcile flags them (`rclone dedupe` only with confirmation). |
+| 11 | **Rate limits / logins** (many simultaneous logins → errors, temporary blocks). | A single `rcd` instance manages all N accounts; sessions are reused; per-account and global concurrency semaphores; exponential backoff with jitter. |
+| 12 | **Credentials**: `rclone.conf` only obscures passwords (obscure ≠ encryption). | Secrets in the Secret Service (GNOME Keyring/KWallet) via `keyring`/`oo7`. The rclone config is generated at runtime (0600 temp file in `XDG_RUNTIME_DIR`, or `config/create` over RC) and never persisted with passwords. 2FA: confirm support in the pinned rclone and expose a field in the UI. |
+| 13 | **Metadata privacy**: the local index reveals folder structure. | SQLite in `XDG_DATA_HOME`, mode 0600; SQLCipher out of MVP scope. Mega is already E2EE; optional `crypt` on top is out of the MVP. |
+| 14 | **External binary dependency** (rclone missing/wrong version). | Detect at startup (`rclone version`), pinned minimum version, actionable error. Not bundled in the MVP; packaging (AppImage/Flatpak) may include it. |
+| 15 | **Orphaned `rcd` process / exposed port.** | Start with `--rc-addr 127.0.0.1:0` (ephemeral port) + random per-session `--rc-user/--rc-pass`; supervisor kills it on drop; `kill_on_drop`. |
+| 16 | **gpui is unstable** (API changes without strict semver; ecosystem in flux). | Exact pin (zed git rev or crates.io version; confirm what is published at scaffold time). Thin view layer isolated in `apps/desktop`; gpui upgrades get their own commit. `gpui-component` for widgets (table, tree, input). |
+| 17 | **gpui on Linux needs system libs** (Vulkan, Wayland/X11, xkbcommon, fontconfig…) and a GPU. | List in README and CI (apt). Check software-rendering fallback; document requirements. |
+| 18 | **Testing without Mega** (real accounts in CI = secrets + flaky + ToS). | Fake accounts = rclone `local`/`memory` backend with simulated limits. `RemoteFs` trait in core with an `rclone` impl and a deterministic `fake` impl. Live Mega tests are manual/`--ignored`, never in CI. |
+| 19 | **Long-running operations in the UI** (cancel, resume, progress). | Job queue in core with persisted states; progress via the rcd's `core/stats`/`job/status`; UI subscribes to an event channel. Resumable after a crash via the journal. |
+| 20 | **Path safety**: dropped symlinks, `..`, invalid names, files changing during upload. | Canonicalize, explicit symlink policy (do not follow by default), snapshot size/mtime before and re-check after. |
 
-## 3. Modelo de dados (SQLite, `rusqlite` bundled)
+## 3. Redundancy model (RAID-style, optional)
+
+Configured per pool, overridable per folder:
+
+- `single` (JBOD, default): one copy, no redundancy.
+- `mirror` (RAID1): N copies on N distinct accounts. In MVP-1.
+- `parity` (RAID5/6-like): erasure coding, k data + m parity parts on distinct accounts. Later phase.
+
+The planner picks N distinct accounts per item; reads choose the healthiest copy (quota, errors); a degraded pool (account down) is shown in the UI with a repair action.
+
+## 4. Data model (SQLite, `rusqlite` bundled)
 
 - `account(id, label, remote_name, quota_total, quota_used, bw_window…, enabled)`
 - `item(id, virtual_path, size, blake3, kind)`; `placement(item_id, account_id, remote_path, state)`
 - `journal(id, op, payload, state, ts)` — write-ahead
-- Diretório virtual = conjunto de contas + política; "3 contas no mesmo diretório" = um *pool*.
+- Virtual directory = set of accounts + policy; "3 accounts in the same directory" = one *pool*.
 
-## 4. Fases
+## 5. Phases
 
-1. **MVP-0**: workspace, CI, `bufonidae-rclone` (spawn rcd, list/about/copy), CLI `account add/list`, `put <path> --pool X`. Fake backend + testes de planner.
-2. **MVP-1**: journal, reconcile, políticas, cotas, `get`/`ls` unificado, TUI-free CLI estável.
-3. **MVP-2**: desktop gpui (contas, pools, drag&drop, fila, saúde das contas).
-4. **Fase 3**: réplica, chunking, watch folder (+ rsync staging se houver caso), empacotamento, website.
+1. **MVP-0**: workspace, CI, `bufonidae-rclone` (spawn rcd, list/about/copy), CLI `account add/list`, `put <path> --pool X`. Fake backend + planner tests.
+2. **MVP-1**: journal, reconcile, policies, quotas, unified `get`/`ls`, `mirror` redundancy, stable CLI.
+3. **MVP-2**: gpui desktop (accounts, pools, drag & drop, queue, account health).
+4. **Phase 3**: `parity`, chunking, watch folder (+ rsync staging if a use case appears), packaging, website.
 
-## 5. Dependências
+## 6. Dependencies
 
-**Sistema**: `rclone` (versão mínima pinada após testar o backend mega), `rsync` (opcional), Secret Service (gnome-keyring/kwallet), libs gpui: `libxkbcommon`, `wayland`, `libxcb`, `vulkan` loader, `fontconfig`, `freetype`. Dev: `gh`, `docker`.
+**System**: `rclone` (minimum version pinned after testing the mega backend), `rsync` (optional), Secret Service (gnome-keyring/kwallet), gpui libs: `libxkbcommon`, `wayland`, `libxcb`, Vulkan loader, `fontconfig`, `freetype`. Dev: `gh`, `docker`.
 
-**Rust, core/rclone/cli** (versões resolvidas com `cargo add`/`cargo info` no scaffold e congeladas no `Cargo.lock`; deps compartilhadas em `[workspace.dependencies]`):
-- `tokio` (rt, process, sync, time) — async, supervisor do rcd
-- `reqwest` (rustls, json; sem openssl) — cliente RC
-- `serde`, `serde_json`, `toml` — protocolo e config
-- `rusqlite` (bundled) — índice/journal
-- `thiserror` (libs), `anyhow` (só binários)
-- `tracing`, `tracing-subscriber` — logs
+**Rust, core/rclone/cli** (versions resolved with `cargo add`/`cargo info` at scaffold time and frozen in `Cargo.lock`; shared deps in `[workspace.dependencies]`):
+- `tokio` (rt, process, sync, time) — async, rcd supervisor
+- `reqwest` (rustls, json; no openssl) — RC client
+- `serde`, `serde_json`, `toml` — protocol and config
+- `rusqlite` (bundled) — index/journal
+- `thiserror` (libs), `anyhow` (binaries only)
+- `tracing`, `tracing-subscriber` — logging
 - `clap` (derive) — CLI
-- `directories` — caminhos XDG
-- `keyring` ou `oo7` — segredos
-- `blake3` — hash local
-- `notify` — watch folder (fase 3)
+- `directories` — XDG paths
+- `keyring` or `oo7` — secrets
+- `blake3` — local hashing
+- `notify` — watch folder (phase 3)
 - `uuid`, `bytesize`, `humantime`
 - dev: `tempfile`, `proptest` (planner), `insta` (snapshots), `wiremock`/`axum` fake rcd, `assert_cmd`
 
-**Desktop**: `gpui`, `gpui-component` (pins coordenados), `rfd` ou diálogo via gpui para seleção de pasta, `ashpd` se precisar portal XDG.
+**Desktop**: `gpui`, `gpui-component` (pinned together), `rfd` or gpui's own dialog for folder selection, `ashpd` if the XDG portal is needed.
 
-**Website**: Topcoat (SSR), fatos lidos dos arquivos do produto em build, `Dockerfile` multi-stage + `compose.yml`.
+**Website**: Topcoat (SSR), facts read from the product's own files at build time, multi-stage `Dockerfile` + `compose.yml`.
 
-**Tooling**: `rustfmt`, `clippy`, `cargo-deny` (licenças/advisories/bans), `cargo-audit`, `cargo-machete`.
+**Tooling**: `rustfmt`, `clippy`, `cargo-deny` (licenses/advisories/bans), `cargo-audit`, `cargo-machete`.
 
-## 6. Boas práticas
+## 7. Best practices
 
-- `rust-toolchain.toml` pinado (1.99.1 hoje), `rustfmt.toml`, `[workspace.lints]` (`unsafe_code = "forbid"` em core, clippy `pedantic` seletivo).
-- `[workspace.package]` herdado (edition, license, rust-version).
-- Errors tipados em libs; `anyhow` só na borda. Sem `unwrap` fora de testes.
-- Core síncrono onde possível; async só na fronteira de I/O. Traits (`RemoteFs`, `Placement`, `Clock`) para teste determinístico.
-- Perfis: `dev debug=0`, deps dev `debug=false`; `release strip=true, lto="thin", codegen-units=16`; `[profile.website]` size-tuned.
-- Commits: gerados com `pionus`, revisados contra o diff; commits de bump de dependência/toolchain separados, com motivo.
-- Nenhum segredo em log; redigir senhas/tokens em `Debug`.
-- Licença e `SECURITY.md`; aviso de ToS no README.
+- Pinned `rust-toolchain.toml` (1.99.1 today), `rustfmt.toml`, `[workspace.lints]` (`unsafe_code = "forbid"` in core, selective clippy `pedantic`).
+- Inherited `[workspace.package]` (edition, license, rust-version).
+- Typed errors in libraries; `anyhow` only at the edge. No `unwrap` outside tests.
+- Synchronous core where possible; async only at the I/O boundary. Traits (`RemoteFs`, `Placement`, `Clock`) for deterministic tests.
+- Profiles: `dev debug=0`, dev deps `debug=false`; `release strip=true, lto="thin", codegen-units=16`; size-tuned `[profile.website]`.
+- Commits drafted with `pionus` and reviewed against the diff; dependency/toolchain bumps in separate commits with the reason.
+- No secrets in logs; redact passwords/tokens in `Debug`.
+- `SECURITY.md`; ToS notice in the README.
 
-## 7. CI/CD (conforme regras do ai-memory)
+## 8. CI/CD
 
 `.github/workflows/ci.yml`:
 - `concurrency: ci-${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true`
 - `permissions: contents: read`; `env: CARGO_TERM_COLOR=always, CARGO_INCREMENTAL=0, CARGO_NET_RETRY=10`
-- `Swatinem/rust-cache@v2` pinado por SHA, mesmo `shared-key` em todos os jobs
-- `--locked` em todo cargo; **um** `cargo fmt --check`, **um** `cargo clippy --workspace --all-targets -- -D warnings`, **um** `cargo test --workspace`
-- apt das libs gpui no job
-- Ferramentas (`cargo-deny`, `cargo-audit`) cacheadas por versão, `cargo install --version X --locked` só em cache miss
-- Actions de terceiros pinadas por commit SHA
+- `Swatinem/rust-cache@v2` pinned by SHA, same `shared-key` in every job
+- `--locked` on every cargo call; **one** `cargo fmt --check`, **one** `cargo clippy --workspace --all-targets -- -D warnings`, **one** `cargo test --workspace`
+- apt install of the gpui libs in the job
+- Tools (`cargo-deny`, `cargo-audit`) cached by version, `cargo install --version X --locked` only on cache miss
+- Third-party actions pinned by commit SHA
 
-Outros workflows:
-- `audit.yml` — semanal: `cargo audit`, `cargo deny check`, relatório de toolchain/ferramentas defasadas (abre issue)
-- `dependabot.yml` — cargo + github-actions (semanal)
-- `release.yml` — em tag `v*`, sem cancel-in-progress: build release do `cli` e `desktop`, tarball + `.deb`/AppImage, checksums, GitHub Release
-- `website.yml` — build da imagem Docker (sem push no PR)
+Other workflows:
+- `audit.yml` — weekly: `cargo audit`, `cargo deny check`, report of outdated toolchain/tools (opens an issue)
+- `dependabot.yml` — cargo + github-actions (weekly)
+- `release.yml` — on `v*` tags, no cancel-in-progress: release builds of `cli` and `desktop`, tarball + `.deb`/AppImage, checksums, GitHub Release
+- `website.yml` — Docker image build (no push on PRs)
 
-## 8. Repositório
+## 9. Repository
 
-`gh repo create` em `Lucas-BRT/bufonidae`, branch padrão `main` (local está em `master`, sem commits → renomear), `.gitignore` (já existe), LICENSE, README, `AGENTS.md`/`CLAUDE.md`.
+Private `Lucas-BRT/bufonidae` on GitHub, default branch `main`, MIT `LICENSE`, README and `AGENTS.md` (including the English-only rule).
 
-## 9. Decisões
+## 10. Open questions
 
-- Repo privado inicialmente, licença MIT.
-- Redundância: opcional e configurável por pool, modelo RAID. Níveis: `single` (JBOD, padrão), `mirror` (RAID1, N cópias em contas distintas), `parity` (estilo RAID5/6 via erasure coding, k+m partes) como evolução. O nível é propriedade do pool (e sobrescrevível por pasta); o planner escolhe N contas distintas por item. `mirror` entra no MVP-1; `parity` depois.
-
-## 10. Em aberto
-
-- Granularidade padrão do placement (pasta inteira vs arquivo a arquivo).
-- Caso de uso do rsync (staging local / espelho NAS) ou adiar.
+- rsync use case (local staging / NAS mirror), or keep it deferred.
