@@ -33,6 +33,8 @@ pub struct Gap {
     /// Ids of connected accounts that hold a confirmed copy.
     pub holders: Vec<String>,
     pub wanted: u8,
+    /// BLAKE3 recorded when it was stored, when known.
+    pub blake3: Option<String>,
 }
 
 /// Files under `prefix` that lack copies on the connected accounts. A copy on
@@ -61,6 +63,7 @@ pub async fn find_gaps(
                 size: file.size,
                 holders,
                 wanted,
+                blake3: file.blake3,
             });
         }
     }
@@ -73,6 +76,7 @@ pub async fn find_gaps(
                 path: lost.path,
                 size: lost.size,
                 holders: Vec::new(),
+                blake3: None,
             });
         }
     }
@@ -165,22 +169,24 @@ pub async fn repair<R: RemoteFs>(
             let Some(account) = accounts.iter().find(|a| &a.id == holder) else {
                 continue;
             };
-            match remote
+            let fetched = remote
                 .download(account, &gap.path, tmp.path(), TEMP_NAME)
-                .await
-            {
-                Ok(()) if std::fs::metadata(&local).is_ok_and(|m| m.len() == gap.size) => {
+                .await;
+            // A damaged replica must not be copied: check the size and the
+            // hash recorded when the file was stored before using it.
+            let checked = match fetched {
+                Ok(()) => crate::get::verify(&local, gap.size, gap.blake3.as_deref()).await,
+                Err(e) => Err(e.to_string()),
+            };
+            match checked {
+                Ok(()) => {
                     downloaded = true;
                     break;
                 }
-                Ok(()) => {
-                    error = format!(
-                        "{}: downloaded size does not match the index",
-                        account.label
-                    );
+                Err(reason) => {
+                    error = format!("{}: {reason}", account.label);
                     let _ = std::fs::remove_file(&local);
                 }
-                Err(e) => error = format!("{}: {e}", account.label),
             }
         }
         if !downloaded {
@@ -429,5 +435,32 @@ mod tests {
         .unwrap();
         assert_eq!(r.lost, ["x.bin"]);
         assert!(!r.is_complete(), "a lost file must not read as success");
+    }
+
+    #[tokio::test]
+    async fn a_damaged_replica_is_never_copied_to_a_new_account() {
+        let (index, fake) = setup(&[("x.bin", 10, &["a", "b"])]).await;
+        // Recorded as it was sent; the fake serves bytes of 1, which differ.
+        let hash = blake3::hash(&[2u8; 10]).to_hex().to_string();
+        index
+            .mark_pending_hashed("x.bin", 10, "a", Some(&hash))
+            .await
+            .unwrap();
+        index.mark_done("x.bin", "a").await.unwrap();
+
+        let accounts = [account("a"), account("b"), account("c")];
+        let r = repair(
+            &fake,
+            &index,
+            &accounts,
+            &MostFreeSpace::default(),
+            &mirror(3),
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(r.repaired.is_empty(), "nothing damaged was propagated");
+        assert!(r.failed[0].1.contains("hash"), "{:?}", r.failed);
+        assert!(fake.uploads.borrow().is_empty());
     }
 }
