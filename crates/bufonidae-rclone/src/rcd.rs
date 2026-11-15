@@ -5,6 +5,7 @@
 //! argv, which other local users can read), and never reads the user's
 //! `rclone.conf`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::process::Stdio;
 use std::time::Duration;
@@ -53,13 +54,21 @@ struct ErrorBody {
 }
 
 /// A running `rclone rcd`. The process is killed when this value is dropped.
-#[derive(Debug)]
 pub struct Rcd {
     child: Child,
     http: reqwest::Client,
     base_url: String,
     user: String,
     pass: String,
+}
+
+impl std::fmt::Debug for Rcd {
+    // Manual: the derived impl would print the RC credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rcd")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Rcd {
@@ -128,8 +137,14 @@ impl Rcd {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<ErrorBody>(&text).map_or(text, |b| b.error);
+            // rclone echoes the request input in its error bodies, and
+            // `config/*` inputs carry passwords: never surface those.
+            let message = if method.starts_with("config/") {
+                "details withheld: the request may contain credentials".to_owned()
+            } else {
+                let text = response.text().await.unwrap_or_default();
+                serde_json::from_str::<ErrorBody>(&text).map_or(text, |b| b.error)
+            };
             return Err(Error::Rpc {
                 method: method.to_owned(),
                 status: status.as_u16(),
@@ -171,6 +186,40 @@ impl Rcd {
                 }),
             )
             .await?;
+        Ok(())
+    }
+
+    /// `config/create`: defines remote `name` of backend `kind` in the daemon's
+    /// in-memory config. Password options are obscured by rclone, as the
+    /// backends expect. Nothing is written to disk.
+    pub async fn config_create(
+        &self,
+        name: &str,
+        kind: &str,
+        parameters: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), Error> {
+        let _: serde_json::Value = self
+            .call(
+                "config/create",
+                &json!({
+                    "name": name,
+                    "type": kind,
+                    "parameters": parameters,
+                    "opt": { "obscure": true, "nonInteractive": true },
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `config/get`: the stored options of remote `name` (passwords obscured).
+    pub async fn config_get(&self, name: &str) -> Result<BTreeMap<String, String>, Error> {
+        self.call("config/get", &json!({ "name": name })).await
+    }
+
+    /// `config/delete`: forgets remote `name`.
+    pub async fn config_delete(&self, name: &str) -> Result<(), Error> {
+        let _: serde_json::Value = self.call("config/delete", &json!({ "name": name })).await?;
         Ok(())
     }
 

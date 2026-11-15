@@ -13,9 +13,12 @@ name = "bufonidae"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 bufonidae-core.workspace = true
 bufonidae-rclone.workspace = true
 clap.workspace = true
+rpassword.workspace = true
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

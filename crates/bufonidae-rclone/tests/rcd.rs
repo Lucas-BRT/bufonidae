@@ -76,3 +76,38 @@ async fn surfaces_rpc_errors() {
     );
     rcd.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn config_create_obscures_passwords_and_delete_forgets() {
+    let Some(rcd) = start().await else { return };
+    let mut params = serde_json::Map::new();
+    params.insert("user".into(), "a@example.com".into());
+    params.insert("pass".into(), "secret123".into());
+
+    // Defining a mega remote does not log in: that happens on first use.
+    rcd.config_create("acct-test", "mega", &params)
+        .await
+        .unwrap();
+    let stored = rcd.config_get("acct-test").await.unwrap();
+    assert_eq!(stored["user"], "a@example.com");
+    assert_ne!(stored["pass"], "secret123");
+
+    rcd.config_delete("acct-test").await.unwrap();
+    assert!(rcd.config_get("acct-test").await.unwrap().is_empty());
+    assert!(!format!("{rcd:?}").contains("pass"));
+    rcd.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_errors_never_echo_the_request() {
+    let Some(rcd) = start().await else { return };
+    let mut params = serde_json::Map::new();
+    params.insert("pass".into(), "secret123".into());
+
+    let err = rcd
+        .config_create("bad", "no-such-backend", &params)
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().contains("secret123"), "{err}");
+    rcd.shutdown().await.unwrap();
+}
