@@ -263,9 +263,13 @@ impl Rcd {
 
 /// Runs `rclone version` and refuses a binary Bufonidae is not tested with.
 async fn verify_binary(binary: &OsStr) -> Result<crate::Version, Error> {
+    // rclone reads every `RCLONE_*` variable as an option, so the user's own
+    // would change (or break) even this check.
+    let mut command = Command::new(binary);
+    scrub_rclone_env(&mut command, std::env::vars_os().map(|(k, _)| k));
     let output = tokio::time::timeout(
         Duration::from_secs(15),
-        Command::new(binary)
+        command
             .arg("version")
             .stdin(Stdio::null())
             .kill_on_drop(true)
