@@ -35,29 +35,81 @@ impl Placement for MostFreeSpace {
     }
 }
 
+/// A file to place, with the number of copies wanted on distinct accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    pub size: u64,
+    pub copies: u8,
+}
+
+/// Picks one account for `size` bytes among those not in `exclude`.
+#[must_use]
+pub fn choose_distinct(
+    policy: &impl Placement,
+    accounts: &[AccountSpace],
+    exclude: &[AccountId],
+    size: u64,
+) -> Option<AccountId> {
+    let candidates: Vec<AccountSpace> = accounts
+        .iter()
+        .filter(|a| !exclude.contains(&a.id))
+        .copied()
+        .collect();
+    policy.choose(&candidates, size)
+}
+
 /// Places a batch of files, largest first (first-fit-decreasing), tracking the
-/// space each placement consumes. Returns, for each entry of `sizes` and in
-/// the same order, the chosen account or `None` when nothing could hold it.
+/// space each placement consumes. Each file gets all its copies on distinct
+/// accounts, or nothing: `None` (and no space reserved) when it cannot get
+/// every copy, so a file is never silently under-protected. Results are in
+/// the order of `wanted`.
+#[must_use]
+pub fn plan_batch_copies(
+    policy: &impl Placement,
+    accounts: &[AccountSpace],
+    wanted: &[Wanted],
+) -> Vec<Option<Vec<AccountId>>> {
+    let mut remaining = accounts.to_vec();
+    let mut order: Vec<usize> = (0..wanted.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(wanted[i].size));
+
+    let mut plan = vec![None; wanted.len()];
+    for i in order {
+        let Wanted { size, copies } = wanted[i];
+        let mut trial = remaining.clone();
+        let mut chosen = Vec::new();
+        for _ in 0..copies.max(1) {
+            let Some(id) = choose_distinct(policy, &trial, &chosen, size) else {
+                break;
+            };
+            if let Some(a) = trial.iter_mut().find(|a| a.id == id) {
+                a.free_bytes = a.free_bytes.saturating_sub(size);
+            }
+            chosen.push(id);
+        }
+        if chosen.len() == usize::from(copies.max(1)) {
+            remaining = trial;
+            plan[i] = Some(chosen);
+        }
+    }
+    plan
+}
+
+/// Single-copy [`plan_batch_copies`].
 #[must_use]
 pub fn plan_batch(
     policy: &impl Placement,
     accounts: &[AccountSpace],
     sizes: &[u64],
 ) -> Vec<Option<AccountId>> {
-    let mut remaining = accounts.to_vec();
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
-
-    let mut plan = vec![None; sizes.len()];
-    for i in order {
-        if let Some(id) = policy.choose(&remaining, sizes[i]) {
-            if let Some(a) = remaining.iter_mut().find(|a| a.id == id) {
-                a.free_bytes = a.free_bytes.saturating_sub(sizes[i]);
-            }
-            plan[i] = Some(id);
-        }
-    }
-    plan
+    let wanted: Vec<Wanted> = sizes
+        .iter()
+        .map(|&size| Wanted { size, copies: 1 })
+        .collect();
+    plan_batch_copies(policy, accounts, &wanted)
+        .into_iter()
+        .map(|p| p.and_then(|ids| ids.first().copied()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -119,5 +171,74 @@ mod tests {
             assert!(used <= a.free_bytes);
         }
         assert!(plan.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn copies_land_on_distinct_accounts() {
+        let accounts = [acc(1, 100), acc(2, 100), acc(3, 100)];
+        let plan = plan_batch_copies(
+            &MostFreeSpace::default(),
+            &accounts,
+            &[
+                Wanted {
+                    size: 10,
+                    copies: 2,
+                },
+                Wanted {
+                    size: 10,
+                    copies: 3,
+                },
+            ],
+        );
+        for ids in plan.iter().flatten() {
+            let mut sorted = ids.clone();
+            sorted.sort_by_key(|a| a.0);
+            sorted.dedup();
+            assert_eq!(sorted.len(), ids.len(), "no account twice for one file");
+        }
+        assert_eq!(plan[0].as_ref().unwrap().len(), 2);
+        assert_eq!(plan[1].as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn missing_copies_mean_no_placement_and_no_reserved_space() {
+        // Two accounts cannot hold three copies; the second file must still
+        // see all the space the failed one did not take.
+        let accounts = [acc(1, 100), acc(2, 100)];
+        let plan = plan_batch_copies(
+            &MostFreeSpace::default(),
+            &accounts,
+            &[
+                Wanted {
+                    size: 90,
+                    copies: 3,
+                },
+                Wanted {
+                    size: 90,
+                    copies: 2,
+                },
+            ],
+        );
+        assert_eq!(plan[0], None);
+        assert_eq!(plan[1].as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn mirror_does_not_overcommit_any_account() {
+        let accounts = [acc(1, 100), acc(2, 60), acc(3, 60)];
+        let wanted: Vec<Wanted> = [50, 40, 30, 30]
+            .iter()
+            .map(|&size| Wanted { size, copies: 2 })
+            .collect();
+        let plan = plan_batch_copies(&MostFreeSpace::default(), &accounts, &wanted);
+        for a in &accounts {
+            let used: u64 = plan
+                .iter()
+                .zip(&wanted)
+                .filter(|(p, _)| p.as_ref().is_some_and(|ids| ids.contains(&a.id)))
+                .map(|(_, w)| w.size)
+                .sum();
+            assert!(used <= a.free_bytes, "account {:?} overcommitted", a.id);
+        }
     }
 }

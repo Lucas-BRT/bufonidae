@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use bufonidae_core::account::AccountStore;
+use bufonidae_core::config::{self, Config};
 use bufonidae_core::get;
 use bufonidae_core::index::Index;
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
 use bufonidae_core::put;
 use bufonidae_core::reconcile;
+use bufonidae_core::repair;
 use bufonidae_core::secrets::KeyringStore;
 use bufonidae_rclone::rcd::Rcd;
 use clap::{Parser, Subcommand};
@@ -58,9 +60,35 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Rebuild the missing copies of files that have fewer than wanted
+    /// (see `redundancy`), e.g. after an account was lost.
+    Repair {
+        /// Only this folder (default: everything).
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
+    /// How many copies of each file to keep, like a RAID level.
+    #[command(subcommand)]
+    Redundancy(RedundancyCommand),
     /// Manage connected Mega accounts.
     #[command(subcommand)]
     Account(AccountCommand),
+}
+
+#[derive(Subcommand)]
+enum RedundancyCommand {
+    /// Show the default and the per-folder levels.
+    Show,
+    /// Set a level: `single`, `mirror` (2 copies) or `mirror:N`. Applies to
+    /// files stored from now on; run `repair` to bring existing ones up to it.
+    Set {
+        level: String,
+        /// Only this folder (default: every file without a folder rule).
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// Remove the rule of a folder.
+    Unset { folder: String },
 }
 
 #[derive(Subcommand)]
@@ -87,7 +115,75 @@ async fn main() -> Result<()> {
     let mut store = AccountStore::load(&path)?;
     let secrets: SharedSecrets = Arc::new(KeyringStore);
 
+    let config_path = Config::default_path()?;
     match cli.command {
+        Command::Redundancy(cmd) => {
+            let mut config = Config::load(&config_path)?;
+            match cmd {
+                RedundancyCommand::Show => {
+                    println!("default  {}", config::describe(config.default_copies()));
+                    for (folder, copies) in config.folders() {
+                        println!("{folder}  {}", config::describe(*copies));
+                    }
+                }
+                RedundancyCommand::Set { level, folder } => {
+                    let copies = config::parse_level(&level)?;
+                    config.set(folder.as_deref(), copies)?;
+                    println!("ok: {}", config::describe(copies));
+                }
+                RedundancyCommand::Unset { folder } => {
+                    config.unset(&folder)?;
+                    println!("removed the rule of {folder}");
+                }
+            }
+        }
+        Command::Repair { prefix } => {
+            let config = Config::load(&config_path)?;
+            let index = Index::open(&Index::default_path()?).await?;
+            let accounts = store.list().to_vec();
+            if accounts.is_empty() {
+                bail!("no accounts connected; run `bufonidae account add` first");
+            }
+            let rcd = Rcd::start("rclone")
+                .await
+                .context("could not start rclone; is it installed and on PATH?")?;
+            let result = async {
+                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
+                    if let Err(e) = result {
+                        eprintln!("warning: account {:?}: {e}", account.label);
+                    }
+                }
+                Ok::<_, anyhow::Error>(
+                    repair::repair(
+                        &rcd,
+                        &index,
+                        &accounts,
+                        &MostFreeSpace::default(),
+                        &config,
+                        &prefix,
+                    )
+                    .await?,
+                )
+            }
+            .await;
+            rcd.shutdown().await?;
+            let report = result?;
+            for (p, label) in &report.repaired {
+                println!("copied      {p}  ->  {label}");
+            }
+            for p in &report.lost {
+                eprintln!("LOST        {p}: no copy on any connected account");
+            }
+            for (p, n) in &report.no_room {
+                eprintln!("NO ROOM     {p}: {n} copies could not be placed");
+            }
+            for (p, reason) in &report.failed {
+                eprintln!("FAILED      {p}: {reason}");
+            }
+            if !report.is_complete() {
+                std::process::exit(1);
+            }
+        }
         Command::Reconcile { prefix, apply } => {
             let index = Index::open(&Index::default_path()?).await?;
             let accounts = store.list().to_vec();
@@ -111,7 +207,17 @@ async fn main() -> Result<()> {
             rcd.shutdown().await?;
             let report = result?;
             print_reconcile(&report);
-            if report.unresolved() > 0 || (!apply && report.fixable() > 0) {
+            let config = Config::load(&config_path)?;
+            let gaps = repair::find_gaps(&index, &accounts, &config, &prefix).await?;
+            for g in &gaps {
+                println!(
+                    "UNDER-COPIED  {}: {} of {} copies; run `bufonidae repair`",
+                    g.path,
+                    g.holders.len(),
+                    g.wanted
+                );
+            }
+            if report.unresolved() > 0 || (!apply && report.fixable() > 0) || !gaps.is_empty() {
                 std::process::exit(1);
             }
         }
@@ -190,6 +296,7 @@ async fn main() -> Result<()> {
             if chosen.is_empty() {
                 bail!("no accounts connected; run `bufonidae account add` first");
             }
+            let config = Config::load(&config_path)?;
             let index = Index::open(&Index::default_path()?).await?;
             let rcd = Rcd::start("rclone")
                 .await
@@ -206,6 +313,7 @@ async fn main() -> Result<()> {
                         &index,
                         &chosen,
                         &MostFreeSpace::default(),
+                        &config,
                         &paths,
                         &to,
                     )
@@ -265,7 +373,7 @@ fn print_report(report: &put::Report) {
         println!("skipped   {} (symlink or unsupported name)", path.display());
     }
     for rel in &report.no_room {
-        eprintln!("NO ROOM   {rel}");
+        eprintln!("NO ROOM   {rel} (not enough accounts or space for every copy)");
     }
     for (rel, reason) in &report.failed {
         eprintln!("FAILED    {rel}: {reason}");

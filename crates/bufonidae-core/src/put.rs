@@ -9,8 +9,9 @@ use std::time::SystemTime;
 use bufonidae_rclone::rcd::Rcd;
 
 use crate::account::Account;
+use crate::config::Config;
 use crate::index::{self, Index};
-use crate::placement::{AccountId, AccountSpace, Placement, plan_batch};
+use crate::placement::{AccountId, AccountSpace, Placement, Wanted, plan_batch_copies};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -270,6 +271,7 @@ pub async fn put<R: RemoteFs>(
     index: &Index,
     accounts: &[Account],
     policy: &impl Placement,
+    config: &Config,
     sources: &[PathBuf],
     dest: &str,
 ) -> Result<Report, Error> {
@@ -303,15 +305,21 @@ pub async fn put<R: RemoteFs>(
         .partition(|f| !present.contains(&f.rel));
     report.already_there = there.into_iter().map(|f| f.rel).collect();
 
-    let sizes: Vec<u64> = todo.iter().map(|f| f.size).collect();
-    let plan = plan_batch(policy, &spaces, &sizes);
+    let wanted: Vec<Wanted> = todo
+        .iter()
+        .map(|f| Wanted {
+            size: f.size,
+            copies: config.copies_for(&join(&dest, &f.rel)),
+        })
+        .collect();
+    let plan = plan_batch_copies(policy, &spaces, &wanted);
 
     for (file, chosen) in todo.iter().zip(plan) {
-        let Some(AccountId(slot)) = chosen else {
+        // `None`: not enough accounts or space for every wanted copy.
+        let Some(targets) = chosen else {
             report.no_room.push(file.rel.clone());
             continue;
         };
-        let account = &accounts[slot as usize];
         if changed_since_scan(file) {
             report
                 .failed
@@ -328,20 +336,26 @@ pub async fn put<R: RemoteFs>(
             continue;
         };
         let remote_path = join(&dest, &file.rel);
-        // Write-ahead: a crash after this line leaves a `pending` trace.
-        index
-            .mark_pending(&remote_path, file.size, &account.id)
-            .await?;
-        match remote.upload(account, parent, name, &remote_path).await {
-            Ok(()) => {
-                index.mark_done(&remote_path, &account.id).await?;
-                report
-                    .uploaded
-                    .push((file.rel.clone(), account.label.clone(), file.size));
+        for AccountId(slot) in targets {
+            let account = &accounts[slot as usize];
+            // Write-ahead: a crash after this line leaves a `pending` trace.
+            index
+                .mark_pending(&remote_path, file.size, &account.id)
+                .await?;
+            match remote.upload(account, parent, name, &remote_path).await {
+                Ok(()) => {
+                    index.mark_done(&remote_path, &account.id).await?;
+                    report
+                        .uploaded
+                        .push((file.rel.clone(), account.label.clone(), file.size));
+                }
+                // Left `pending` on purpose: a failed upload may have left a
+                // partial file for `reconcile` to find. The other copies are
+                // still attempted; `repair` completes the set later.
+                Err(e) => report
+                    .failed
+                    .push((file.rel.clone(), format!("{}: {e}", account.label))),
             }
-            // Left `pending` on purpose: a failed upload may have left a
-            // partial file for `reconcile` to find.
-            Err(e) => report.failed.push((file.rel.clone(), e.to_string())),
         }
     }
     Ok(report)
@@ -443,6 +457,7 @@ mod tests {
             &index,
             &[account("one"), account("two")],
             &MostFreeSpace::default(),
+            &Config::default(),
             &[dir.path().join("photos")],
             "Pics",
         )
@@ -471,6 +486,7 @@ mod tests {
             &index,
             &[account("one"), account("two")],
             &MostFreeSpace::default(),
+            &Config::default(),
             &[dir.path().join("photos")],
             "Pics",
         )
@@ -492,6 +508,7 @@ mod tests {
             &index,
             &[account("one")],
             &MostFreeSpace::default(),
+            &Config::default(),
             &[dir.path().join("photos")],
             "Pics",
         )
@@ -510,6 +527,7 @@ mod tests {
             &index,
             &[account("one")],
             &MostFreeSpace::default(),
+            &Config::default(),
             &[dir.path().join("photos")],
             "Pics",
         )
@@ -518,5 +536,81 @@ mod tests {
         assert_eq!(report.failed.len(), 2);
         assert!(index.list("").await.unwrap().is_empty());
         assert_eq!(index.pending().await.unwrap().len(), 2);
+    }
+
+    fn mirror(copies: u8) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::load(dir.path().join("config.toml")).unwrap();
+        c.set(None, copies).unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn mirror_puts_each_file_on_distinct_accounts() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000), ("two", 1000), ("three", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let report = put(
+            &remote,
+            &index,
+            &[account("one"), account("two"), account("three")],
+            &MostFreeSpace::default(),
+            &mirror(2),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.uploaded.len(), 4, "2 files x 2 copies");
+        for f in index.list("Pics/").await.unwrap() {
+            assert_eq!(f.accounts.len(), 2, "{}", f.path);
+        }
+    }
+
+    #[tokio::test]
+    async fn too_few_accounts_for_the_copies_places_nothing() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let report = put(
+            &remote,
+            &index,
+            &[account("one")],
+            &MostFreeSpace::default(),
+            &mirror(2),
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.no_room.len(), 2);
+        assert!(remote.uploads.borrow().is_empty());
+        assert!(index.placements("").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_override_beats_the_default() {
+        let dir = tree();
+        let remote = fake(&[("one", 1000), ("two", 1000)]);
+        let index = Index::open_memory().await.unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::load(cfg_dir.path().join("config.toml")).unwrap();
+        config.set(Some("Pics/photos/sub"), 2).unwrap();
+        put(
+            &remote,
+            &index,
+            &[account("one"), account("two")],
+            &MostFreeSpace::default(),
+            &config,
+            &[dir.path().join("photos")],
+            "Pics",
+        )
+        .await
+        .unwrap();
+        let files = index.list("Pics/").await.unwrap();
+        let by_path = |p: &str| files.iter().find(|f| f.path == p).unwrap().accounts.len();
+        assert_eq!(by_path("Pics/photos/a.bin"), 1);
+        assert_eq!(by_path("Pics/photos/sub/b.bin"), 2);
     }
 }

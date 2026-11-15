@@ -58,6 +58,8 @@ Configured per pool, overridable per folder:
 - `mirror` (RAID1): N copies on N distinct accounts. In MVP-1.
 - `parity` (RAID5/6-like): erasure coding, k data + m parity parts on distinct accounts. Later phase.
 
+Implemented: `single` and `mirror:N` (N = 2..8), set as a default and per folder (longest matching folder wins) with `bufonidae redundancy set|show|unset`; stored in `config.toml`. There is no separate "pool" object yet: the default level plays the pool-wide role. A level applies to files stored from then on; `bufonidae repair` brings existing files up to it, and also rebuilds copies lost with an account. A file that cannot get every copy (too few accounts or no room) is not stored at all, instead of being silently under-protected. `parity` is still future work.
+
 The planner picks N distinct accounts per item; reads choose the healthiest copy (quota, errors); a degraded pool (account down) is shown in the UI with a repair action.
 
 ## 4. Data model (Turso, embedded)

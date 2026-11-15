@@ -3,9 +3,7 @@
 //! Secrets (passwords, sessions) never live here: see [`crate::secrets`].
 
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -159,28 +157,9 @@ impl AccountStore {
             path: self.path.clone(),
             source,
         };
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).map_err(io)?;
-        }
         let text = toml::to_string_pretty(&self.file)?;
-        let tmp = tmp_path(&self.path);
-        let mut out = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(io)?;
-        out.write_all(text.as_bytes()).map_err(io)?;
-        out.sync_all().map_err(io)?;
-        fs::rename(&tmp, &self.path).map_err(io)
+        crate::fsutil::write_private(&self.path, &text).map_err(io)
     }
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_owned();
-    name.push(".tmp");
-    path.with_file_name(name)
 }
 
 fn validate_label(label: &str) -> Result<(), Error> {
