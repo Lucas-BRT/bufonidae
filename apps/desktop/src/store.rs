@@ -13,11 +13,12 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
     progress::Progress,
 };
 
-use crate::backend::{Backend, Inspection};
+use crate::backend::{Backend, Inspection, StoreJob, StoreOutcome};
 use crate::format;
 
 /// How many problem lines the result lists before summarising the rest.
@@ -36,6 +37,8 @@ struct Counters {
     bytes_total: u64,
     bytes_done: u64,
     current: String,
+    /// The user asked to stop; waiting for the job to wind down.
+    cancelling: bool,
 }
 
 enum Phase {
@@ -43,6 +46,8 @@ enum Phase {
     Ready,
     Running(Counters),
     Finished(Report),
+    /// Stopped by the user after the given amount of work.
+    Cancelled(Counters),
     /// Failed after some uploads may have happened: nothing to retry safely.
     Failed(String),
 }
@@ -53,6 +58,10 @@ pub struct StoreForm {
     dest: Entity<InputState>,
     inspection: Option<Inspection>,
     phase: Phase,
+    /// The user ticked "store it anyway" for a large or risky drop.
+    confirmed: bool,
+    /// Asks the running job to stop.
+    cancel_job: Option<tokio::sync::oneshot::Sender<()>>,
     /// A problem found before anything was uploaded; the form stays editable.
     error: Option<String>,
 }
@@ -104,6 +113,8 @@ impl StoreForm {
             dest,
             inspection: None,
             phase: Phase::Inspecting,
+            confirmed: false,
+            cancel_job: None,
             error: None,
         }
     }
@@ -117,6 +128,14 @@ impl StoreForm {
         Some((copies, inspection.accounts >= usize::from(copies)))
     }
 
+    /// Large drops (over the limit in Settings) and anything that includes
+    /// the home folder need an explicit "store it anyway".
+    fn needs_confirmation(&self) -> bool {
+        self.inspection
+            .as_ref()
+            .is_some_and(|i| i.includes_home || i.bytes > i.config.large_upload_bytes())
+    }
+
     fn can_start(&self, cx: &Context<Self>) -> bool {
         matches!(self.phase, Phase::Ready)
             && self
@@ -124,13 +143,30 @@ impl StoreForm {
                 .as_ref()
                 .is_some_and(|i| i.files > 0 && i.accounts > 0)
             && self.plan(cx).is_some_and(|(_, enough)| enough)
+            && (!self.needs_confirmation() || self.confirmed)
+    }
+
+    /// Asks the running upload to stop. rclone is shut down, which interrupts
+    /// the transfer in flight; copies already stored stay stored.
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Running(c) = &mut self.phase
+            && !c.cancelling
+        {
+            c.cancelling = true;
+            if let Some(tx) = self.cancel_job.take() {
+                let _ = tx.send(());
+            }
+            cx.notify();
+        }
     }
 
     /// Closes the dialog, except while the upload runs.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         match self.phase {
             Phase::Running(_) => {}
-            Phase::Finished(_) => cx.emit(StoreEvent::Closed { changed: true }),
+            Phase::Finished(_) | Phase::Cancelled(_) => {
+                cx.emit(StoreEvent::Closed { changed: true });
+            }
             _ => cx.emit(StoreEvent::Closed { changed: false }),
         }
     }
@@ -144,10 +180,15 @@ impl StoreForm {
         self.phase = Phase::Running(Counters::default());
         cx.notify();
 
-        let mut job = self.backend.store(self.paths.clone(), dest);
+        let StoreJob {
+            mut events,
+            cancel,
+            result,
+        } = self.backend.store(self.paths.clone(), dest);
+        self.cancel_job = Some(cancel);
         cx.spawn(async move |this, cx| {
             let mut started = false;
-            while let Some(event) = job.events.recv().await {
+            while let Some(event) = events.recv().await {
                 started = true;
                 this.update(cx, |this, cx| {
                     if let Phase::Running(c) = &mut this.phase {
@@ -171,13 +212,20 @@ impl StoreForm {
                 })
                 .ok();
             }
-            let result = match job.result.await {
+            let result = match result.await {
                 Ok(result) => result,
                 Err(join_error) => Err(join_error.to_string()),
             };
             this.update(cx, |this, cx| {
                 this.phase = match (result, started) {
-                    (Ok(report), _) => Phase::Finished(report),
+                    (Ok(StoreOutcome::Done(report)), _) => Phase::Finished(report),
+                    (Ok(StoreOutcome::Cancelled), _) => {
+                        let counters = match std::mem::replace(&mut this.phase, Phase::Inspecting) {
+                            Phase::Running(c) => c,
+                            _ => Counters::default(),
+                        };
+                        Phase::Cancelled(counters)
+                    }
                     // Failed before anything was planned: let the user fix it.
                     (Err(message), false) => {
                         this.error = Some(message);
@@ -288,7 +336,11 @@ impl Render for StoreForm {
                     0.0
                 };
                 card()
-                    .child(title("Storing files"))
+                    .child(title(if c.cancelling {
+                        "Stopping…"
+                    } else {
+                        "Storing files"
+                    }))
                     .child(Progress::new().value(percent))
                     .child(div().text_color(muted).child(format!(
                         "{} of {} copies · {} of {}",
@@ -305,11 +357,55 @@ impl Render for StoreForm {
                             .child(c.current.clone()),
                     )
                     .child(div().text_sm().text_color(muted).child(
-                        "Keep the app open until this finishes. If it is interrupted, \
-                         run `bufonidae reconcile` to tidy up.",
+                        "Cancel stops the transfer in progress. Copies already stored stay \
+                         stored.",
                     ))
+                    .child(
+                        div().h_flex().justify_end().child(
+                            Button::new("stop")
+                                .label(if c.cancelling {
+                                    "Stopping…"
+                                } else {
+                                    "Cancel"
+                                })
+                                .disabled(c.cancelling)
+                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                        ),
+                    )
                     .into_any_element()
             }
+
+            Phase::Cancelled(c) => card()
+                .child(title("Cancelled"))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .child(Self::message_line(
+                            IconName::Info,
+                            format!(
+                                "{} of {} copies were processed before stopping.",
+                                c.copies_done, c.copies_total
+                            ),
+                            muted,
+                        ))
+                        .child(Self::message_line(
+                            IconName::TriangleAlert,
+                            "The file being sent when you cancelled may be incomplete. \
+                             Run `bufonidae reconcile` to check it."
+                                .to_owned(),
+                            muted,
+                        )),
+                )
+                .child(
+                    div().h_flex().justify_end().child(
+                        Button::new("done")
+                            .primary()
+                            .label("Done")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    ),
+                )
+                .into_any_element(),
 
             Phase::Finished(report) => {
                 let complete = report.is_complete();
@@ -437,6 +533,35 @@ impl Render for StoreForm {
                             .into_any_element(),
                     );
                 }
+                if self.needs_confirmation() {
+                    let text = if inspection.includes_home {
+                        "This includes your whole home folder, which is almost never what \
+                         you want to store."
+                            .to_owned()
+                    } else {
+                        format!(
+                            "This is {}, over the {} limit set in Settings.",
+                            format::bytes(inspection.bytes),
+                            format::bytes(inspection.config.large_upload_bytes())
+                        )
+                    };
+                    notes.push(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(Self::message_line(IconName::TriangleAlert, text, danger))
+                            .child(
+                                Checkbox::new("confirm-large")
+                                    .label("I understand, store it anyway")
+                                    .checked(self.confirmed)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.confirmed = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element(),
+                    );
+                }
                 let can_start = self.can_start(cx);
 
                 card()
@@ -451,6 +576,13 @@ impl Render for StoreForm {
                                     .font_medium()
                                     .child(self.summary_of_paths()),
                             )
+                            .children((self.paths.len() == 1).then(|| {
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(self.paths[0].display().to_string())
+                            }))
                             .child(div().text_color(muted).child(format!(
                                 "{} · {}{}",
                                 format::files(inspection.files),

@@ -6,8 +6,7 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, ExternalPaths, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, Styled as _, Window,
-    div, px,
+    IntoElement, KeyDownEvent, ParentElement as _, Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _,
@@ -17,7 +16,9 @@ use gpui_component::{
 
 use crate::add_account::{AddAccountForm, FormEvent};
 use crate::backend::{Backend, Snapshot, StartupError};
+use crate::browse::{BrowseEvent, BrowseForm};
 use crate::format;
+use crate::settings::SettingsView;
 use crate::store::{StoreEvent, StoreForm};
 use crate::theme;
 
@@ -25,12 +26,14 @@ use crate::theme;
 enum Modal {
     AddAccount(Entity<AddAccountForm>),
     Store(Entity<StoreForm>),
+    Browse(Entity<BrowseForm>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Files,
     Accounts,
+    Settings,
 }
 
 enum Data {
@@ -44,6 +47,8 @@ pub struct BufonidaeApp {
     screen: Screen,
     data: Data,
     modal: Option<Modal>,
+    /// Absent when the app could not start.
+    settings: Option<Entity<SettingsView>>,
 }
 
 impl BufonidaeApp {
@@ -61,7 +66,12 @@ impl BufonidaeApp {
             screen: Screen::Files,
             data: Data::Loading,
             modal: None,
+            settings: None,
         };
+        if let Ok(backend) = &app.backend {
+            let backend = Arc::clone(backend);
+            app.settings = Some(cx.new(|cx| SettingsView::new(backend, window, cx)));
+        }
         app.reload(cx);
         app
     }
@@ -124,21 +134,30 @@ impl BufonidaeApp {
         cx.notify();
     }
 
-    /// Asks the system for files or folders to store.
-    pub(crate) fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: true,
-            multiple: true,
-            prompt: Some("Store".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = picked.await {
-                this.update_in(cx, |this, window, cx| this.open_store(paths, window, cx))
-                    .ok();
-            }
-        })
+    /// Opens the file browser, where files and folders can be mixed.
+    pub(crate) fn open_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if self.modal.is_some() {
+            return;
+        }
+        let backend = Arc::clone(backend);
+        let form = cx.new(|cx| BrowseForm::new(backend, cx));
+        cx.subscribe_in(
+            &form,
+            window,
+            |this, _form, event: &BrowseEvent, window, cx| {
+                this.modal = None;
+                if let BrowseEvent::Chosen(paths) = event {
+                    this.open_store(paths.clone(), window, cx);
+                }
+                cx.notify();
+            },
+        )
         .detach();
+        self.modal = Some(Modal::Browse(form));
+        cx.notify();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -190,6 +209,14 @@ impl BufonidaeApp {
                         .child(item("Accounts", IconName::CircleUser, Screen::Accounts, cx)),
                 ),
             )
+            .child(
+                SidebarGroup::new("App").child(SidebarMenu::new().child(item(
+                    "Settings",
+                    IconName::Settings,
+                    Screen::Settings,
+                    cx,
+                ))),
+            )
             .footer(
                 SidebarFooter::new().child(
                     div()
@@ -213,6 +240,10 @@ impl BufonidaeApp {
             Data::Ready(_) => match self.screen {
                 Screen::Files => self.files_screen(window, cx).into_any_element(),
                 Screen::Accounts => self.accounts_screen(window, cx).into_any_element(),
+                Screen::Settings => match &self.settings {
+                    Some(settings) => settings.clone().into_any_element(),
+                    None => div().into_any_element(),
+                },
             },
         }
     }
@@ -250,6 +281,7 @@ impl Render for BufonidaeApp {
         let overlay = self.modal.as_ref().map(|modal| match modal {
             Modal::AddAccount(form) => form.clone().into_any_element(),
             Modal::Store(form) => form.clone().into_any_element(),
+            Modal::Browse(form) => form.clone().into_any_element(),
         });
         let overlay = overlay.map(|form| {
             // A scrim over the whole window with the form centred on it.
@@ -269,6 +301,7 @@ impl Render for BufonidaeApp {
                     match &this.modal {
                         Some(Modal::AddAccount(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         Some(Modal::Store(form)) => form.update(cx, |f, cx| f.cancel(cx)),
+                        Some(Modal::Browse(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         None => {}
                     }
                 }))

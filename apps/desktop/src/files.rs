@@ -28,8 +28,8 @@ impl BufonidaeApp {
         let add_files = Button::new("add-files")
             .primary()
             .icon(IconName::Plus)
-            .label("Add files")
-            .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)));
+            .label("Add")
+            .on_click(cx.listener(|this, _, window, cx| this.open_browser(window, cx)));
 
         let header = div()
             .h_flex()
@@ -57,7 +57,7 @@ impl BufonidaeApp {
                 cx,
                 Some(IconName::Inbox),
                 "Nothing stored yet",
-                Some("Drop files or folders anywhere on this window, or use Add files.".to_owned()),
+                Some("Drop files or folders anywhere on this window, or use Add.".to_owned()),
             ));
         }
 

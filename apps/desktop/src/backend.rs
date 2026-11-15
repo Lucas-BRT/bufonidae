@@ -90,6 +90,7 @@ impl Backend {
     /// Looks at what was dropped and at the settings, without touching Mega.
     pub fn inspect(&self, paths: Vec<PathBuf>) -> JoinHandle<Result<Inspection, String>> {
         self.runtime.spawn(async move {
+            let roots = paths.clone();
             let scan = tokio::task::spawn_blocking(move || put::scan(&paths))
                 .await
                 .map_err(|e| e.to_string())?
@@ -101,11 +102,18 @@ impl Backend {
                     .len();
             let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
+            let home = home_dir();
+            let includes_home = home.as_ref().is_some_and(|home| {
+                roots
+                    .iter()
+                    .any(|root| std::fs::canonicalize(root).is_ok_and(|r| covers(&r, home)))
+            });
             Ok(Inspection {
                 files: scan.files.len(),
                 bytes: scan.files.iter().map(|f| f.size).sum(),
                 skipped: scan.skipped.len(),
                 accounts,
+                includes_home,
                 config,
             })
         })
@@ -115,6 +123,7 @@ impl Backend {
     /// redundancy settings. Progress arrives on `events` as it happens.
     pub fn store(&self, paths: Vec<PathBuf>, dest: String) -> StoreJob {
         let (tx, events) = unbounded_channel();
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let index = Arc::clone(&self.index);
         let result = self.runtime.spawn(async move {
             let store =
@@ -139,27 +148,63 @@ impl Backend {
                 for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
                     result.map_err(|e| format!("Account {:?}: {e}", account.label))?;
                 }
-                put::put_observed(
+                // A dropped sender is not a cancel request.
+                let cancelled = async {
+                    if cancel_rx.await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let policy = MostFreeSpace::default();
+                // The receiver may be gone (window closed); the store goes on.
+                let mut observer = |progress| {
+                    let _ = tx.send(progress);
+                };
+                let store = put::put_observed(
                     &rcd,
                     &index,
                     &accounts,
-                    &MostFreeSpace::default(),
+                    &policy,
                     &config,
                     &paths,
                     &dest,
-                    &mut |progress| {
-                        // The receiver may be gone (window closed); the store goes on.
-                        let _ = tx.send(progress);
-                    },
-                )
-                .await
-                .map_err(|e| e.to_string())
+                    &mut observer,
+                );
+                tokio::pin!(store);
+                tokio::select! {
+                    report = &mut store => report.map(StoreOutcome::Done).map_err(|e| e.to_string()),
+                    () = cancelled => Ok(StoreOutcome::Cancelled),
+                }
             }
             .await;
+            // Shutting rclone down is what actually stops a transfer in flight.
             let _ = rcd.shutdown().await;
             outcome
         });
-        StoreJob { events, result }
+        StoreJob {
+            events,
+            cancel,
+            result,
+        }
+    }
+
+    /// Lists a folder for the file browser, off the UI thread.
+    pub fn list_dir(&self, dir: PathBuf) -> JoinHandle<Result<Vec<DirEntryInfo>, String>> {
+        self.runtime.spawn(async move {
+            tokio::task::spawn_blocking(move || read_dir_sorted(&dir))
+                .await
+                .map_err(|e| e.to_string())?
+        })
+    }
+
+    /// Saves the "ask before storing more than this" limit.
+    pub fn save_large_upload_bytes(&self, bytes: u64) -> JoinHandle<Result<(), String>> {
+        self.runtime.spawn(async move {
+            let path = Config::default_path().map_err(|e| e.to_string())?;
+            let mut config = Config::load(path).map_err(|e| e.to_string())?;
+            config
+                .set_large_upload_bytes(bytes)
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Connects a Mega account: proves the login through rclone, then stores
@@ -205,13 +250,68 @@ pub struct Inspection {
     /// Symlinks and unsupported names, which are never uploaded.
     pub skipped: usize,
     pub accounts: usize,
+    /// One of the dropped paths is the home folder or contains it.
+    pub includes_home: bool,
     pub config: Config,
 }
 
-/// A running store job: progress events, then the final report.
+/// How a store job ended.
+pub enum StoreOutcome {
+    Done(put::Report),
+    /// The user cancelled. Copies already stored stay stored; an interrupted
+    /// one is left `pending` in the index for `reconcile`.
+    Cancelled,
+}
+
+/// A running store job: progress events, a way to cancel, then the result.
 pub struct StoreJob {
     pub events: UnboundedReceiver<Progress>,
-    pub result: JoinHandle<Result<put::Report, String>>,
+    /// Sending on it asks the job to stop.
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+    pub result: JoinHandle<Result<StoreOutcome, String>>,
+}
+
+/// One entry of the file browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    /// Links are shown but cannot be chosen: `put` never follows them.
+    pub is_symlink: bool,
+}
+
+/// Folders first, then files, each group by name ignoring case.
+pub fn read_dir_sorted(dir: &std::path::Path) -> Result<Vec<DirEntryInfo>, String> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        entries.push(DirEntryInfo {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path(),
+            is_dir: meta.is_dir(),
+            is_symlink: meta.is_symlink(),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `true` when `root` is `home` itself or a folder that contains it, i.e.
+/// storing `root` would include the whole home folder.
+pub fn covers(root: &std::path::Path, home: &std::path::Path) -> bool {
+    home.starts_with(root)
 }
 
 /// What the "add account" form submits. The password is only held until the
@@ -244,6 +344,34 @@ pub fn suggest_label(email: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covers_the_home_folder_and_its_ancestors_only() {
+        use std::path::Path;
+        let home = Path::new("/home/ana");
+        assert!(covers(Path::new("/home/ana"), home));
+        assert!(covers(Path::new("/home"), home));
+        assert!(covers(Path::new("/"), home));
+        assert!(!covers(Path::new("/home/ana/Pictures"), home));
+        assert!(!covers(Path::new("/home/anabel"), home));
+        assert!(!covers(Path::new("/tmp"), home));
+    }
+
+    #[test]
+    fn lists_folders_first_then_files_ignoring_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("zeta")).unwrap();
+        std::fs::create_dir(dir.path().join("Alpha")).unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("A.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("b.txt"), dir.path().join("link")).unwrap();
+
+        let entries = read_dir_sorted(dir.path()).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "zeta", "A.txt", "b.txt", "link"]);
+        assert!(entries.last().unwrap().is_symlink);
+        assert!(read_dir_sorted(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn suggests_a_valid_label_from_the_email() {

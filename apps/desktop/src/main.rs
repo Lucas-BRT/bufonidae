@@ -2,8 +2,10 @@ mod accounts;
 mod add_account;
 mod app;
 mod backend;
+mod browse;
 mod files;
 mod format;
+mod settings;
 mod store;
 mod theme;
 

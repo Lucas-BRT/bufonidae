@@ -43,6 +43,13 @@ fn one() -> u8 {
     1
 }
 
+/// Ask for confirmation before storing more than this, by default (1 GB).
+pub const DEFAULT_LARGE_UPLOAD_BYTES: u64 = 1_000_000_000;
+
+fn default_large_upload() -> u64 {
+    DEFAULT_LARGE_UPLOAD_BYTES
+}
+
 /// Redundancy settings. `copies` = number of copies on distinct accounts:
 /// 1 is `single` (JBOD, no redundancy), N >= 2 is `mirror:N`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +59,10 @@ pub struct Config {
     /// Folder (relative path) -> copies; the longest matching folder wins.
     #[serde(default)]
     folders: BTreeMap<String, u8>,
+    /// The desktop app asks for confirmation before storing more than this
+    /// many bytes in one go. 0 means always ask.
+    #[serde(default = "default_large_upload")]
+    large_upload_bytes: u64,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -61,6 +72,7 @@ impl Default for Config {
         Self {
             default_copies: 1,
             folders: BTreeMap::new(),
+            large_upload_bytes: DEFAULT_LARGE_UPLOAD_BYTES,
             path: PathBuf::new(),
         }
     }
@@ -140,6 +152,17 @@ impl Config {
     #[must_use]
     pub fn default_copies(&self) -> u8 {
         self.default_copies
+    }
+
+    #[must_use]
+    pub fn large_upload_bytes(&self) -> u64 {
+        self.large_upload_bytes
+    }
+
+    /// Sets the confirmation threshold and saves.
+    pub fn set_large_upload_bytes(&mut self, bytes: u64) -> Result<(), Error> {
+        self.large_upload_bytes = bytes;
+        self.save()
     }
 
     #[must_use]
@@ -250,5 +273,25 @@ mod tests {
         assert!(Config::load(&path).is_err());
         fs::write(&path, "default_copies = 200\n").unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn large_upload_threshold_defaults_to_one_gb_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = Config::load(&path).unwrap();
+        assert_eq!(c.large_upload_bytes(), 1_000_000_000);
+
+        c.set_large_upload_bytes(5_000_000_000).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().large_upload_bytes(),
+            5_000_000_000
+        );
+
+        // An older file without the key still loads, with the default.
+        fs::write(&path, "default_copies = 2\n").unwrap();
+        let old = Config::load(&path).unwrap();
+        assert_eq!(old.large_upload_bytes(), 1_000_000_000);
+        assert_eq!(old.default_copies(), 2);
     }
 }
