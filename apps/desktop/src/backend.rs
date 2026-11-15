@@ -11,6 +11,8 @@ use bufonidae_core::index::{self, Index, IndexedFile};
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
 use bufonidae_core::put::{self, Progress};
+use bufonidae_core::reconcile;
+use bufonidae_core::repair;
 use bufonidae_core::secrets::KeyringStore;
 use bufonidae_rclone::Error as RcloneError;
 use bufonidae_rclone::rcd::Rcd;
@@ -32,6 +34,9 @@ pub enum StartupError {
 pub struct Snapshot {
     pub accounts: Vec<Account>,
     pub files: Vec<IndexedFile>,
+    /// Copies whose upload started and was never confirmed (an interrupted
+    /// store). `reconcile` settles them.
+    pub pending: usize,
 }
 
 impl Snapshot {
@@ -92,7 +97,12 @@ impl Backend {
                 .list()
                 .to_vec();
             let files = index.list("").await.map_err(|e| e.to_string())?;
-            Ok(Snapshot { accounts, files })
+            let pending = index.pending().await.map_err(|e| e.to_string())?.len();
+            Ok(Snapshot {
+                accounts,
+                files,
+                pending,
+            })
         })
     }
 
@@ -270,6 +280,76 @@ impl Backend {
             config
                 .set_large_upload_bytes(bytes)
                 .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Compares the index with what the accounts really hold. With `apply`
+    /// false nothing is changed: it only reports.
+    pub fn check_files(&self, apply: bool) -> JoinHandle<Result<CheckOutcome, String>> {
+        let index = Arc::clone(&self.index);
+        self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if store.list().is_empty() {
+                return Err("Connect a Mega account first.".to_owned());
+            }
+            let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let Connected {
+                rcd,
+                usable,
+                unreachable,
+            } = connected_rcd(&store).await?;
+            let outcome = async {
+                let mut report = reconcile::reconcile(&rcd, &index, &usable, "", apply)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                report.unreachable.extend(unreachable);
+                let gaps = repair::find_gaps(&index, &usable, &config, "")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(CheckOutcome { report, gaps })
+            }
+            .await;
+            let _ = rcd.shutdown().await;
+            outcome
+        })
+    }
+
+    /// Rebuilds the missing copies of files that have fewer than wanted.
+    pub fn repair_copies(&self) -> JoinHandle<Result<repair::Report, String>> {
+        let index = Arc::clone(&self.index);
+        self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            if store.list().is_empty() {
+                return Err("Connect a Mega account first.".to_owned());
+            }
+            let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let Connected {
+                rcd,
+                usable,
+                unreachable,
+            } = connected_rcd(&store).await?;
+            let result = repair::repair(
+                &rcd,
+                &index,
+                &usable,
+                &MostFreeSpace::default(),
+                &config,
+                "",
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .map(|mut report| {
+                report.unreachable.extend(unreachable);
+                report
+            });
+            let _ = rcd.shutdown().await;
+            result
         })
     }
 
@@ -477,6 +557,13 @@ async fn connected_rcd(store: &AccountStore) -> Result<Connected, String> {
     })
 }
 
+/// What a files check found.
+pub struct CheckOutcome {
+    pub report: reconcile::Report,
+    /// Files with fewer copies than the redundancy settings ask for.
+    pub gaps: Vec<repair::Gap>,
+}
+
 /// How one account is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountHealth {
@@ -580,6 +667,7 @@ mod tests {
         };
         let snapshot = Snapshot {
             accounts: Vec::new(),
+            pending: 0,
             files: vec![
                 file("only-a", &["a"]),
                 file("both", &["a", "b"]),

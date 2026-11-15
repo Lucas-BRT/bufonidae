@@ -3,6 +3,7 @@ mod add_account;
 mod app;
 mod backend;
 mod browse;
+mod check;
 mod download;
 mod files;
 mod format;

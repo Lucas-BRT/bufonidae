@@ -95,13 +95,55 @@ impl BufonidaeApp {
             )
             .child(add);
 
+        // A store that was interrupted leaves copies unconfirmed; saying so
+        // here means the user hears about it without having to look.
+        let notice = (snapshot.pending > 0).then(|| {
+            let danger = cx.theme().danger;
+            div()
+                .h_flex()
+                .items_center()
+                .gap_3()
+                .mx_6()
+                .mb_3()
+                .p_3()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(danger)
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .size_4()
+                        .text_color(danger)
+                        .flex_none(),
+                )
+                .child(div().flex_1().child(format!(
+                    "{} {} an unfinished upload. Check your files to settle {}.",
+                    snapshot.pending,
+                    if snapshot.pending == 1 {
+                        "copy is"
+                    } else {
+                        "copies are"
+                    },
+                    if snapshot.pending == 1 { "it" } else { "them" },
+                )))
+                .child(
+                    Button::new("settle-pending")
+                        .label("Check files")
+                        .on_click(cx.listener(|this, _, _, cx| this.go_check(cx))),
+                )
+        });
+
         if snapshot.files.is_empty() {
-            return div().v_flex().size_full().child(header).child(centered(
-                cx,
-                Some(IconName::Inbox),
-                "Nothing stored yet",
-                Some("Drop files or folders anywhere on this window, or use Add.".to_owned()),
-            ));
+            return div()
+                .v_flex()
+                .size_full()
+                .child(header)
+                .children(notice)
+                .child(centered(
+                    cx,
+                    Some(IconName::Inbox),
+                    "Nothing stored yet",
+                    Some("Drop files or folders anywhere on this window, or use Add.".to_owned()),
+                ));
         }
 
         let accounts = snapshot.accounts;
@@ -224,6 +266,7 @@ impl BufonidaeApp {
             .v_flex()
             .size_full()
             .child(header)
+            .children(notice)
             .child(div().h_px().bg(border))
             .child(list)
     }

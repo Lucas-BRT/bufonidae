@@ -18,6 +18,7 @@ use gpui_component::{
 use crate::add_account::{AddAccountForm, FormEvent};
 use crate::backend::{AccountHealth, Backend, HealthStatus, Snapshot, StartupError};
 use crate::browse::{BrowseEvent, BrowseForm};
+use crate::check::CheckState;
 use crate::download::{DownloadEvent, DownloadForm};
 use crate::format;
 use crate::remove_account::{RemoveEvent, RemoveForm};
@@ -55,6 +56,7 @@ impl Health {
 enum Screen {
     Files,
     Accounts,
+    Check,
     Settings,
 }
 
@@ -72,6 +74,7 @@ pub struct BufonidaeApp {
     data: Data,
     modal: Option<Modal>,
     pub(crate) health: Health,
+    pub(crate) check: CheckState,
     /// Absent when the app could not start.
     settings: Option<Entity<SettingsView>>,
 }
@@ -93,6 +96,7 @@ impl BufonidaeApp {
             data: Data::Loading,
             modal: None,
             health: Health::NotChecked,
+            check: CheckState::Idle,
             settings: None,
         };
         if let Ok(backend) = &app.backend {
@@ -254,6 +258,92 @@ impl BufonidaeApp {
         cx.notify();
     }
 
+    /// Goes to the Check screen and runs a check.
+    pub(crate) fn go_check(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Check;
+        self.run_check(false, cx);
+    }
+
+    /// Compares the index with the accounts. `apply` writes the safe fixes to
+    /// the index; without it nothing changes.
+    pub(crate) fn run_check(&mut self, apply: bool, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if matches!(self.check, CheckState::Running(_)) {
+            return;
+        }
+        self.check = CheckState::Running(if apply {
+            "Applying the fixes."
+        } else {
+            "Comparing with your accounts."
+        });
+        cx.notify();
+        let job = backend.check_files(apply);
+        cx.spawn(async move |this, cx| {
+            let result = match job.await {
+                Ok(result) => result,
+                Err(join_error) => Err(join_error.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.check = match result {
+                    Ok(outcome) => CheckState::Result {
+                        outcome: Box::new(outcome),
+                        applied: apply,
+                        repaired: None,
+                    },
+                    Err(message) => CheckState::Failed(message),
+                };
+                // Applying changes what the Files screen shows.
+                if apply {
+                    this.reload(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Rebuilds missing copies, then checks again to show the new state.
+    pub(crate) fn run_repair(&mut self, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if matches!(self.check, CheckState::Running(_)) {
+            return;
+        }
+        self.check = CheckState::Running("Rebuilding missing copies.");
+        cx.notify();
+        let repair_job = backend.repair_copies();
+        let backend = Arc::clone(backend);
+        cx.spawn(async move |this, cx| {
+            let repaired = match repair_job.await {
+                Ok(result) => result,
+                Err(join_error) => Err(join_error.to_string()),
+            };
+            let state = match repaired {
+                Err(message) => CheckState::Failed(message),
+                Ok(report) => match backend.check_files(false).await {
+                    Ok(Ok(outcome)) => CheckState::Result {
+                        outcome: Box::new(outcome),
+                        applied: false,
+                        repaired: Some(Box::new(report)),
+                    },
+                    Ok(Err(message)) => CheckState::Failed(message),
+                    Err(join_error) => CheckState::Failed(join_error.to_string()),
+                },
+            };
+            this.update(cx, |this, cx| {
+                this.check = state;
+                this.reload(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Shows `folder` on the Files screen.
     pub(crate) fn open_folder(&mut self, folder: String, cx: &mut Context<Self>) {
         self.folder = folder;
@@ -388,7 +478,8 @@ impl BufonidaeApp {
                 SidebarGroup::new("Library").child(
                     SidebarMenu::new()
                         .child(item("Files", IconName::Folder, Screen::Files, cx))
-                        .child(item("Accounts", IconName::CircleUser, Screen::Accounts, cx)),
+                        .child(item("Accounts", IconName::CircleUser, Screen::Accounts, cx))
+                        .child(item("Check", IconName::CircleCheck, Screen::Check, cx)),
                 ),
             )
             .child(
@@ -422,6 +513,7 @@ impl BufonidaeApp {
             Data::Ready(_) => match self.screen {
                 Screen::Files => self.files_screen(window, cx).into_any_element(),
                 Screen::Accounts => self.accounts_screen(window, cx).into_any_element(),
+                Screen::Check => self.check_screen(window, cx).into_any_element(),
                 Screen::Settings => match &self.settings {
                     Some(settings) => settings.clone().into_any_element(),
                     None => div().into_any_element(),
