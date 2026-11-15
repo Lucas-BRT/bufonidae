@@ -75,7 +75,7 @@ impl AddAccountForm {
         }
     }
 
-    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.phase, Phase::Submitting) {
             return;
         }
@@ -104,6 +104,13 @@ impl AddAccountForm {
             password,
             two_fa: (!code.is_empty()).then_some(code),
         };
+
+        // The secrets now live only in `request`: take them out of the text
+        // fields so they do not sit in the widgets while the sign-in runs, or
+        // afterwards if it fails (the user retypes them).
+        for secret in [&self.password, &self.code] {
+            secret.update(cx, |field, cx| field.set_value("", window, cx));
+        }
 
         self.phase = Phase::Submitting;
         cx.notify();

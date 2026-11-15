@@ -109,6 +109,27 @@ pub trait RemoteFs {
     ) -> impl Future<Output = Result<(), Error>>;
 }
 
+/// A local folder as rclone's `fs` argument.
+///
+/// It must be absolute: a relative `name:path` could be read as a remote
+/// called `name`, while a path starting with `/` is always local. It must be
+/// valid UTF-8: a lossy conversion would silently address a different folder.
+fn local_fs(path: &Path) -> Result<String, Error> {
+    if !path.is_absolute() {
+        return Err(Error::Remote(format!(
+            "{} is not an absolute path",
+            path.display()
+        )));
+    }
+    match path.to_str() {
+        Some(text) if !text.contains('\0') => Ok(text.to_owned()),
+        _ => Err(Error::Remote(format!(
+            "{} is not a valid UTF-8 path",
+            path.display()
+        ))),
+    }
+}
+
 impl RemoteFs for Rcd {
     async fn free_space(&self, account: &Account) -> Result<Option<u64>, Error> {
         let about = self
@@ -153,7 +174,7 @@ impl RemoteFs for Rcd {
         self.copy_file(
             &format!("{}:", account.remote_name()),
             remote_path,
-            &dest_dir.to_string_lossy(),
+            &local_fs(dest_dir)?,
             dest_rel,
         )
         .await
@@ -168,7 +189,7 @@ impl RemoteFs for Rcd {
         remote_path: &str,
     ) -> Result<(), Error> {
         self.copy_file(
-            &parent.to_string_lossy(),
+            &local_fs(parent)?,
             name,
             &format!("{}:", account.remote_name()),
             remote_path,
@@ -1197,5 +1218,20 @@ mod tests {
             "two copies are impossible with one account"
         );
         assert_eq!(report.unreachable.len(), 1);
+    }
+
+    #[test]
+    fn a_local_folder_given_to_rclone_is_absolute_and_exact() {
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(
+            local_fs(Path::new("/home/a b/c:d")).unwrap(),
+            "/home/a b/c:d"
+        );
+        // A relative path that looks like `remote:path` must not be passed on.
+        assert!(local_fs(Path::new("mega:docs")).is_err());
+        assert!(local_fs(Path::new("relative/dir")).is_err());
+        // Invalid UTF-8 would be mangled by a lossy conversion.
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/bad\xff"));
+        assert!(local_fs(bad).is_err());
     }
 }

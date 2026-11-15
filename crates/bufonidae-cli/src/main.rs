@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
                 RedundancyCommand::Show => {
                     println!("default  {}", config::describe(config.default_copies()));
                     for (folder, copies) in config.folders() {
-                        println!("{folder}  {}", config::describe(*copies));
+                        println!("{}  {}", show(folder), config::describe(*copies));
                     }
                 }
                 RedundancyCommand::Set { level, folder } => {
@@ -203,7 +203,7 @@ async fn main() -> Result<()> {
                 }
                 RedundancyCommand::Unset { folder } => {
                     config.unset(&folder)?;
-                    println!("removed the rule of {folder}");
+                    println!("removed the rule of {}", show(&folder));
                 }
             }
         }
@@ -239,20 +239,28 @@ async fn main() -> Result<()> {
             rcd.shutdown().await?;
             let report = result?;
             for (p, label) in &report.repaired {
+                let p = show(p);
+                let label = show(label);
                 println!("copied      {p}  ->  {label}");
             }
             for (label, why) in &report.unreachable {
+                let label = show(label);
+                let why = show(why);
                 eprintln!(
                     "UNREACHABLE {label}: left out, and the copies it holds were not counted: {why}"
                 );
             }
             for p in &report.lost {
+                let p = show(p);
                 eprintln!("LOST        {p}: no copy on any connected account");
             }
             for (p, n) in &report.no_room {
+                let p = show(p);
                 eprintln!("NO ROOM     {p}: {n} copies could not be placed");
             }
             for (p, reason) in &report.failed {
+                let p = show(p);
+                let reason = show(reason);
                 eprintln!("FAILED      {p}: {reason}");
             }
             if !report.is_complete() {
@@ -317,7 +325,12 @@ async fn main() -> Result<()> {
                             .map_or("?", |a| a.label.as_str())
                     })
                     .collect();
-                println!("{:>12}  {}  {}", file.size, labels.join(","), file.path);
+                println!(
+                    "{:>12}  {}  {}",
+                    file.size,
+                    show(&labels.join(",")),
+                    show(&file.path)
+                );
             }
         }
         Command::Get { path, out } => {
@@ -336,15 +349,22 @@ async fn main() -> Result<()> {
             rcd.shutdown().await?;
             let report = result?;
             for (p, label, size) in &report.downloaded {
+                let p = show(p);
+                let label = show(label);
                 println!("downloaded  {p}  <-  {label}  ({size} bytes)");
             }
             for p in &report.already_there {
-                println!("exists      {}", p.display());
+                let p = show(&p.display().to_string());
+                println!("exists      {p}");
             }
             for (label, why) in &report.unreachable {
+                let label = show(label);
+                let why = show(why);
                 eprintln!("UNREACHABLE {label}: not used: {why}");
             }
             for (p, reason) in &report.failed {
+                let p = show(p);
+                let reason = show(reason);
                 eprintln!("FAILED      {p}: {reason}");
             }
             if !report.is_complete() {
@@ -444,24 +464,35 @@ async fn main() -> Result<()> {
 
 fn print_report(report: &put::Report) {
     for (rel, label, size) in &report.uploaded {
+        let rel = show(rel);
+        let label = show(label);
         println!("uploaded  {rel}  ->  {label}  ({size} bytes)");
     }
     for rel in &report.already_there {
+        let rel = show(rel);
         println!("exists    {rel}");
     }
     for path in &report.skipped {
-        println!("skipped   {} (symlink or unsupported name)", path.display());
+        let path = show(&path.display().to_string());
+        println!("skipped   {path} (symlink or unsupported name)");
     }
     for (label, why) in &report.unreachable {
+        let label = show(label);
+        let why = show(why);
         eprintln!("UNREACHABLE {label}: not used: {why}");
     }
     for (rel, reason) in &report.differs {
+        let rel = show(rel);
+        let reason = show(reason);
         eprintln!("DIFFERS   {rel}: {reason}");
     }
     for rel in &report.no_room {
+        let rel = show(rel);
         eprintln!("NO ROOM   {rel} (not enough accounts or space for every copy)");
     }
     for (rel, reason) in &report.failed {
+        let rel = show(rel);
+        let reason = show(reason);
         eprintln!("FAILED    {rel}: {reason}");
     }
 }
@@ -471,39 +502,55 @@ fn print_reconcile(r: &reconcile::Report) {
         |applied: bool, done: &'static str, would: &'static str| if applied { done } else { would };
     println!("consistent  {}", r.consistent);
     for (p, a) in &r.confirmed {
+        let p = show(p);
+        let a = show(a);
         println!(
             "{}  {p}  ({a})",
             verb(r.applied, "confirmed  ", "would confirm")
         );
     }
     for (p, a) in &r.dropped {
+        let p = show(p);
+        let a = show(a);
         println!(
             "{}  {p}  ({a}): not on the remote",
             verb(r.applied, "forgot     ", "would forget")
         );
     }
     for (p, a, size) in &r.imported {
+        let p = show(p);
+        let a = show(a);
         println!(
             "{}  {p}  ({a}, {size} bytes)",
             verb(r.applied, "imported   ", "would import")
         );
     }
     for (p, a, want, got) in &r.size_mismatch {
+        let p = show(p);
+        let a = show(a);
         eprintln!("SIZE       {p} ({a}): index says {want}, remote has {got}");
     }
     for (p, a, want, got) in &r.partial {
+        let p = show(p);
+        let a = show(a);
         eprintln!("PARTIAL    {p} ({a}): expected {want}, remote has {got}; left in place");
     }
     for (p, a, want, got) in &r.conflicts {
+        let p = show(p);
+        let a = show(a);
         eprintln!("CONFLICT   {p} ({a}): other copies are {want} bytes, this one is {got}");
     }
     for (p, a) in &r.duplicates {
+        let p = show(p);
+        let a = show(a);
         eprintln!(
             "DUPLICATE  {p} ({a}): the name exists twice there, so it was left alone; \
              remove one of them on mega.nz"
         );
     }
     for (a, e) in &r.unreachable {
+        let a = show(a);
+        let e = show(e);
         eprintln!("UNREACHABLE {a}: {e}; its entries were not touched");
     }
     if r.unverifiable > 0 {
@@ -536,4 +583,11 @@ async fn sign_in(
         }
     }
     usable
+}
+
+/// Makes a name safe to print: control characters (which could redraw or
+/// rewrite the terminal) are shown as `\u{..}`. File names and rclone's
+/// messages are untrusted.
+fn show(text: &str) -> String {
+    bufonidae_rclone::escape_control(text)
 }

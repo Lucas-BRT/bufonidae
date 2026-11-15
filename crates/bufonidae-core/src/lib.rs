@@ -11,6 +11,7 @@ pub mod get;
 pub mod hashing;
 pub mod index;
 pub mod manager;
+pub mod paths;
 pub mod placement;
 pub mod put;
 pub mod reconcile;

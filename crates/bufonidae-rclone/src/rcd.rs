@@ -79,7 +79,12 @@ impl Rcd {
         let user = random_hex().map_err(Error::Spawn)?;
         let pass = random_hex().map_err(Error::Spawn)?;
 
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        // The user's own rclone settings (`RCLONE_CONFIG`, log levels, delete
+        // modes, ...) must not change what this daemon does, or leak through
+        // its logs. Only what is set below reaches it.
+        scrub_rclone_env(&mut command, std::env::vars_os().map(|(k, _)| k));
+        let mut child = command
             .args(["rcd", "--rc-addr", "127.0.0.1:0", "--config", ""])
             .env("RCLONE_RC_USER", &user)
             .env("RCLONE_RC_PASS", &pass)
@@ -106,7 +111,7 @@ impl Rcd {
             }
             Err(Error::Startup(format!(
                 "process exited before serving; output: {}",
-                seen.join(" | ")
+                crate::escape_control(&seen.join(" | "))
             )))
         })
         .await
@@ -117,7 +122,14 @@ impl Rcd {
 
         Ok(Self {
             child,
-            http: reqwest::Client::new(),
+            // The daemon is on this machine's loopback: never go through a
+            // configured proxy (it would see the credentials) and never follow
+            // a redirect (it could point somewhere else).
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(Error::Http)?,
             base_url,
             user,
             pass,
@@ -145,7 +157,9 @@ impl Rcd {
                 "details withheld: the request may contain credentials".to_owned()
             } else {
                 let text = response.text().await.unwrap_or_default();
-                serde_json::from_str::<ErrorBody>(&text).map_or(text, |b| b.error)
+                crate::escape_control(
+                    &serde_json::from_str::<ErrorBody>(&text).map_or(text, |b| b.error),
+                )
             };
             return Err(Error::Rpc {
                 method: method.to_owned(),
@@ -265,6 +279,15 @@ async fn verify_binary(binary: &OsStr) -> Result<crate::Version, Error> {
     crate::check_supported(&text, allow)
 }
 
+/// Removes every `RCLONE_*` variable of the current environment from the child.
+fn scrub_rclone_env(command: &mut Command, names: impl Iterator<Item = std::ffi::OsString>) {
+    for name in names {
+        if name.to_string_lossy().starts_with("RCLONE_") {
+            command.env_remove(name);
+        }
+    }
+}
+
 fn random_hex() -> std::io::Result<String> {
     use std::fmt::Write as _;
     use std::io::Read as _;
@@ -275,4 +298,47 @@ fn random_hex() -> std::io::Result<String> {
         let _ = write!(out, "{b:02x}");
         out
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn the_users_rclone_settings_are_removed_from_the_child_but_other_variables_are_not() {
+        let mut command = Command::new("rclone");
+        let names = [
+            "RCLONE_CONFIG",
+            "RCLONE_CONFIG_PASS",
+            "RCLONE_LOG_LEVEL",
+            "RCLONE_MEGA_DEBUG",
+            "RCLONE_RC_USER",
+            "PATH",
+            "HTTPS_PROXY",
+            "NOT_RCLONE_X",
+        ]
+        .map(OsString::from);
+        scrub_rclone_env(&mut command, names.into_iter());
+
+        let removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "RCLONE_CONFIG",
+            "RCLONE_CONFIG_PASS",
+            "RCLONE_LOG_LEVEL",
+            "RCLONE_MEGA_DEBUG",
+            "RCLONE_RC_USER",
+        ] {
+            assert!(removed.iter().any(|n| n == name), "{name} was not removed");
+        }
+        // The network settings and PATH still reach rclone (it needs them).
+        for name in ["PATH", "HTTPS_PROXY", "NOT_RCLONE_X"] {
+            assert!(!removed.iter().any(|n| n == name), "{name} was removed");
+        }
+    }
 }

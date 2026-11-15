@@ -136,11 +136,7 @@ pub fn read(path: &Path) -> Result<Export, Error> {
 }
 
 fn safe_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.starts_with('/')
-        && path
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
+    crate::paths::is_safe_stored_path(path)
 }
 
 fn validate(export: &Export) -> Result<(), Error> {

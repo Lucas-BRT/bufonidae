@@ -1,6 +1,6 @@
 //! `get`: bring a file, or a whole folder, back from the pool.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::account::Account;
 use crate::index::{self, Index, IndexedFile};
@@ -50,13 +50,10 @@ pub(crate) fn is_under(path: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The index is local state, so its paths are not trusted: a relative path
-/// with a `..`, a root or an empty part must never reach the filesystem.
+/// The index is local state, so its paths are not trusted: a path that could
+/// leave the destination folder must never reach the filesystem.
 fn is_safe_relative(rel: &str) -> bool {
-    !rel.is_empty()
-        && Path::new(rel)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
+    crate::paths::is_safe_stored_path(rel)
 }
 
 /// Downloads `path` (a file or a folder) into `out`. A file lands directly in

@@ -62,6 +62,30 @@ pub enum Error {
     },
 }
 
+/// Longest diagnostic text kept from rclone, in characters.
+const MAX_DIAGNOSTIC: usize = 1000;
+
+/// Makes text from rclone (or from a file name) safe to show: control
+/// characters, including the escape that starts terminal sequences, become a
+/// visible `\u{..}` form, and the length is capped. rclone's messages and the
+/// names of the user's files are untrusted data.
+#[must_use]
+pub fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_DIAGNOSTIC));
+    for (count, c) in text.chars().enumerate() {
+        if count >= MAX_DIAGNOSTIC {
+            out.push('…');
+            break;
+        }
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Checks the output of `rclone version` against [`MIN_VERSION`]. Pre-release
 /// builds are refused too; `allow_untested` waives both checks.
 pub fn check_supported(output: &str, allow_untested: bool) -> Result<Version, Error> {
@@ -202,5 +226,19 @@ mod tests {
             line.contains(&format!("\"{TESTED_VERSION}\"")),
             "ci.yml says {line:?}, the code expects {TESTED_VERSION}"
         );
+    }
+
+    #[test]
+    fn control_characters_cannot_reach_a_terminal() {
+        let hostile = "ok\x1b[2J\x1b]0;pwned\x07 line\nbreak\r\0end";
+        let shown = escape_control(hostile);
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.contains("\\u{1b}"));
+        assert!(shown.starts_with("ok") && shown.ends_with("end"));
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(escape_control("fotos/são joão.jpg"), "fotos/são joão.jpg");
+        // Length is capped.
+        let long = "x".repeat(5000);
+        assert!(escape_control(&long).chars().count() <= MAX_DIAGNOSTIC + 1);
     }
 }
