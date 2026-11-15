@@ -1,0 +1,185 @@
+//! The stored files as a folder tree, derived from their flat paths.
+
+use std::collections::BTreeMap;
+
+use bufonidae_core::index::IndexedFile;
+
+/// One row of a folder: a subfolder (with what it holds) or a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    Folder {
+        name: String,
+        path: String,
+        files: usize,
+        bytes: u64,
+    },
+    File {
+        name: String,
+        path: String,
+        size: u64,
+        accounts: Vec<String>,
+    },
+}
+
+impl Row {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Folder { path, .. } | Self::File { path, .. } => path,
+        }
+    }
+}
+
+fn join(folder: &str, name: &str) -> String {
+    if folder.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+/// What `folder` directly contains: subfolders first, then files, each by
+/// name ignoring case. `folder` is `""` for the top level.
+pub fn rows(files: &[IndexedFile], folder: &str) -> Vec<Row> {
+    let prefix = if folder.is_empty() {
+        String::new()
+    } else {
+        format!("{folder}/")
+    };
+    let mut folders: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    let mut direct = Vec::new();
+    for file in files {
+        let Some(rest) = file.path.strip_prefix(&prefix) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            Some((first, _)) => {
+                let entry = folders.entry(first.to_owned()).or_default();
+                entry.0 += 1;
+                entry.1 += file.size;
+            }
+            None if !rest.is_empty() => direct.push(Row::File {
+                name: rest.to_owned(),
+                path: file.path.clone(),
+                size: file.size,
+                accounts: file.accounts.clone(),
+            }),
+            None => {}
+        }
+    }
+    let mut out: Vec<Row> = folders
+        .into_iter()
+        .map(|(name, (files, bytes))| Row::Folder {
+            path: join(folder, &name),
+            name,
+            files,
+            bytes,
+        })
+        .collect();
+    out.sort_by_key(|r| match r {
+        Row::Folder { name, .. } => name.to_lowercase(),
+        Row::File { .. } => String::new(),
+    });
+    direct.sort_by_key(|r| match r {
+        Row::File { name, .. } => name.to_lowercase(),
+        Row::Folder { .. } => String::new(),
+    });
+    out.extend(direct);
+    out
+}
+
+/// `("Photos", "Photos")`, `("2026", "Photos/2026")` for `Photos/2026`.
+pub fn crumbs(folder: &str) -> Vec<(String, String)> {
+    let mut path = String::new();
+    folder
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|segment| {
+            path = join(&path, segment);
+            (segment.to_owned(), path.clone())
+        })
+        .collect()
+}
+
+/// `true` when something is stored under `folder` (or it is the top level).
+pub fn exists(files: &[IndexedFile], folder: &str) -> bool {
+    folder.is_empty()
+        || files.iter().any(|f| {
+            f.path
+                .strip_prefix(folder)
+                .is_some_and(|r| r.starts_with('/'))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str, size: u64) -> IndexedFile {
+        IndexedFile {
+            path: path.to_owned(),
+            size,
+            accounts: vec!["a".to_owned()],
+        }
+    }
+
+    fn sample() -> Vec<IndexedFile> {
+        vec![
+            file("README.txt", 10),
+            file("Photos/2026/a.jpg", 100),
+            file("Photos/2026/b.jpg", 200),
+            file("Photos/2025/c.jpg", 300),
+            file("Photos/cover.png", 5),
+            file("photos-old/x.bin", 1),
+        ]
+    }
+
+    #[test]
+    fn top_level_shows_folders_then_files() {
+        let r = rows(&sample(), "");
+        let names: Vec<_> = r
+            .iter()
+            .map(|r| match r {
+                Row::Folder { name, .. } | Row::File { name, .. } => name.as_str(),
+            })
+            .collect();
+        assert_eq!(names, ["Photos", "photos-old", "README.txt"]);
+        assert_eq!(
+            r[0],
+            Row::Folder {
+                name: "Photos".into(),
+                path: "Photos".into(),
+                files: 4,
+                bytes: 605
+            }
+        );
+    }
+
+    #[test]
+    fn a_folder_lists_its_direct_children_only() {
+        let r = rows(&sample(), "Photos");
+        assert_eq!(r.len(), 3, "2025, 2026 and cover.png; not photos-old");
+        assert!(matches!(&r[0], Row::Folder { name, files: 1, .. } if name == "2025"));
+        assert!(matches!(&r[1], Row::Folder { name, files: 2, bytes: 300, .. } if name == "2026"));
+        assert!(matches!(&r[2], Row::File { path, .. } if path == "Photos/cover.png"));
+    }
+
+    #[test]
+    fn crumbs_and_existence() {
+        assert_eq!(
+            crumbs("Photos/2026"),
+            [
+                ("Photos".to_owned(), "Photos".to_owned()),
+                ("2026".to_owned(), "Photos/2026".to_owned())
+            ]
+        );
+        assert!(crumbs("").is_empty());
+        let files = sample();
+        assert!(exists(&files, ""));
+        assert!(exists(&files, "Photos/2026"));
+        assert!(!exists(&files, "Photos/2027"));
+        assert!(
+            !exists(&files, "Phot"),
+            "a prefix of a name is not a folder"
+        );
+    }
+}

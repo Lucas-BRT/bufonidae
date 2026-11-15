@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, ExternalPaths, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement as _, Render, Styled as _, Window, div, px,
+    IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions, Render, Styled as _, Window,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _,
@@ -17,6 +18,7 @@ use gpui_component::{
 use crate::add_account::{AddAccountForm, FormEvent};
 use crate::backend::{Backend, Snapshot, StartupError};
 use crate::browse::{BrowseEvent, BrowseForm};
+use crate::download::{DownloadEvent, DownloadForm};
 use crate::format;
 use crate::settings::SettingsView;
 use crate::store::{StoreEvent, StoreForm};
@@ -27,6 +29,7 @@ enum Modal {
     AddAccount(Entity<AddAccountForm>),
     Store(Entity<StoreForm>),
     Browse(Entity<BrowseForm>),
+    Download(Entity<DownloadForm>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,6 +48,8 @@ enum Data {
 pub struct BufonidaeApp {
     backend: Result<Arc<Backend>, StartupError>,
     screen: Screen,
+    /// The folder open on the Files screen (`""` is the top level).
+    pub(crate) folder: String,
     data: Data,
     modal: Option<Modal>,
     /// Absent when the app could not start.
@@ -64,6 +69,7 @@ impl BufonidaeApp {
         let mut app = Self {
             backend,
             screen: Screen::Files,
+            folder: String::new(),
             data: Data::Loading,
             modal: None,
             settings: None,
@@ -134,6 +140,58 @@ impl BufonidaeApp {
         cx.notify();
     }
 
+    /// Shows `folder` on the Files screen.
+    pub(crate) fn open_folder(&mut self, folder: String, cx: &mut Context<Self>) {
+        self.folder = folder;
+        cx.notify();
+    }
+
+    /// Asks for a destination folder, then downloads `path` into it.
+    pub(crate) fn start_download(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() || self.backend.is_err() {
+            return;
+        }
+        // Only folders are wanted here, which is what the system dialog offers.
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Download here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(mut dirs))) = picked.await
+                && let Some(out) = dirs.pop()
+            {
+                this.update_in(cx, |this, _window, cx| this.open_download(path, out, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn open_download(&mut self, path: String, out: PathBuf, cx: &mut Context<Self>) {
+        let Ok(backend) = &self.backend else {
+            return;
+        };
+        if self.modal.is_some() {
+            return;
+        }
+        let backend = Arc::clone(backend);
+        let form = cx.new(|cx| DownloadForm::new(&backend, path, out, cx));
+        cx.subscribe(&form, |this, _form, _event: &DownloadEvent, cx| {
+            this.modal = None;
+            cx.notify();
+        })
+        .detach();
+        self.modal = Some(Modal::Download(form));
+        cx.notify();
+    }
+
     /// Opens the file browser, where files and folders can be mixed.
     pub(crate) fn open_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(backend) = &self.backend else {
@@ -172,7 +230,13 @@ impl BufonidaeApp {
             };
             this.update(cx, |this, cx| {
                 this.data = match result {
-                    Ok(snapshot) => Data::Ready(snapshot),
+                    Ok(snapshot) => {
+                        // The open folder may be gone after a reload.
+                        if !crate::tree::exists(&snapshot.files, &this.folder) {
+                            this.folder.clear();
+                        }
+                        Data::Ready(snapshot)
+                    }
                     Err(message) => Data::Failed(message),
                 };
                 cx.notify();
@@ -282,6 +346,7 @@ impl Render for BufonidaeApp {
             Modal::AddAccount(form) => form.clone().into_any_element(),
             Modal::Store(form) => form.clone().into_any_element(),
             Modal::Browse(form) => form.clone().into_any_element(),
+            Modal::Download(form) => form.clone().into_any_element(),
         });
         let overlay = overlay.map(|form| {
             // A scrim over the whole window with the form centred on it.
@@ -302,6 +367,7 @@ impl Render for BufonidaeApp {
                         Some(Modal::AddAccount(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         Some(Modal::Store(form)) => form.update(cx, |f, cx| f.cancel(cx)),
                         Some(Modal::Browse(form)) => form.update(cx, |f, cx| f.cancel(cx)),
+                        Some(Modal::Download(form)) => form.update(cx, |f, cx| f.close(cx)),
                         None => {}
                     }
                 }))

@@ -59,6 +59,55 @@ pub async fn get<R: RemoteFs>(
     path: &str,
     out: &Path,
 ) -> Result<Report, Error> {
+    get_observed(remote, index, accounts, path, out, &mut |_| {}).await
+}
+
+/// A step of a running [`get_observed`]. Every matching file produces exactly
+/// one of `Downloaded`, `Skipped` or `Failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// What will be attempted: how many files and their total size.
+    Planned {
+        files: usize,
+        bytes: u64,
+    },
+    Downloaded {
+        path: String,
+        account: String,
+        size: u64,
+    },
+    /// A local file was already there and is left alone.
+    Skipped {
+        path: String,
+    },
+    Failed {
+        path: String,
+        reason: String,
+    },
+}
+
+fn fail(
+    report: &mut Report,
+    observer: &mut (dyn FnMut(Progress) + Send),
+    path: String,
+    reason: String,
+) {
+    observer(Progress::Failed {
+        path: path.clone(),
+        reason: reason.clone(),
+    });
+    report.failed.push((path, reason));
+}
+
+/// [`get`], reporting each step to `observer` as it happens.
+pub async fn get_observed<R: RemoteFs>(
+    remote: &R,
+    index: &Index,
+    accounts: &[Account],
+    path: &str,
+    out: &Path,
+    observer: &mut (dyn FnMut(Progress) + Send),
+) -> Result<Report, Error> {
     let path = path.trim_matches('/');
     let files: Vec<IndexedFile> = index
         .list(path)
@@ -70,6 +119,11 @@ pub async fn get<R: RemoteFs>(
         return Err(Error::NotFound(path.to_owned()));
     }
 
+    observer(Progress::Planned {
+        files: files.len(),
+        bytes: files.iter().map(|f| f.size).sum(),
+    });
+
     // Local names are relative to the parent of the requested path.
     let parent_len = path.rfind('/').map_or(0, |i| i + 1);
     let mut report = Report::default();
@@ -77,13 +131,19 @@ pub async fn get<R: RemoteFs>(
     for file in files {
         let rel = &file.path[parent_len.min(file.path.len())..];
         if !is_safe_relative(rel) {
-            report
-                .failed
-                .push((file.path.clone(), "unsafe path in the index".into()));
+            fail(
+                &mut report,
+                observer,
+                file.path.clone(),
+                "unsafe path in the index".into(),
+            );
             continue;
         }
         let target = out.join(rel);
         if target.exists() {
+            observer(Progress::Skipped {
+                path: file.path.clone(),
+            });
             report.already_there.push(target);
             continue;
         }
@@ -94,10 +154,12 @@ pub async fn get<R: RemoteFs>(
             .filter_map(|id| accounts.iter().find(|a| &a.id == id))
             .collect();
         if holders.is_empty() {
-            report.failed.push((
+            fail(
+                &mut report,
+                observer,
                 file.path.clone(),
                 "none of the accounts holding it is connected".into(),
-            ));
+            );
             continue;
         }
 
@@ -127,8 +189,15 @@ pub async fn get<R: RemoteFs>(
             }
         }
         match done {
-            Some(label) => report.downloaded.push((file.path, label, file.size)),
-            None => report.failed.push((file.path, last_error)),
+            Some(label) => {
+                observer(Progress::Downloaded {
+                    path: file.path.clone(),
+                    account: label.clone(),
+                    size: file.size,
+                });
+                report.downloaded.push((file.path, label, file.size));
+            }
+            None => fail(&mut report, observer, file.path, last_error),
         }
     }
     Ok(report)
@@ -310,5 +379,55 @@ mod tests {
         assert!(is_under("a", "a"));
         assert!(!is_under("ab/c", "a"));
         assert!(is_under("anything", ""));
+    }
+
+    #[tokio::test]
+    async fn observer_sees_the_plan_and_one_event_per_file() {
+        let (index, fake) = indexed(&[
+            ("d/a.bin", 5, &["one"]),
+            ("d/b.bin", 3, &["one"]),
+            ("d/c.bin", 2, &["ghost"]),
+        ])
+        .await;
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir(out.path().join("d")).unwrap();
+        std::fs::write(out.path().join("d/b.bin"), b"mine").unwrap();
+
+        let mut events = Vec::new();
+        let report = get_observed(
+            &fake,
+            &index,
+            &[account("one")],
+            "d",
+            out.path(),
+            &mut |p| events.push(p),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            events[0],
+            Progress::Planned {
+                files: 3,
+                bytes: 10
+            }
+        );
+        assert_eq!(events.len(), 4, "plan + one event per file");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Progress::Downloaded { path, .. } if path == "d/a.bin"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Progress::Skipped { path } if path == "d/b.bin"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Progress::Failed { path, .. } if path == "d/c.bin"))
+        );
+        assert_eq!(report.downloaded.len(), 1);
     }
 }

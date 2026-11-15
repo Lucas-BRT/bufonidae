@@ -3,11 +3,13 @@ mod add_account;
 mod app;
 mod backend;
 mod browse;
+mod download;
 mod files;
 mod format;
 mod settings;
 mod store;
 mod theme;
+mod tree;
 
 use std::sync::Arc;
 

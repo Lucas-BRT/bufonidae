@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bufonidae_core::account::{Account, AccountStore};
 use bufonidae_core::config::Config;
+use bufonidae_core::get;
 use bufonidae_core::index::{self, Index, IndexedFile};
 use bufonidae_core::manager::{self, SharedSecrets};
 use bufonidae_core::placement::MostFreeSpace;
@@ -136,18 +137,8 @@ impl Backend {
             let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
 
-            let rcd = Rcd::start("rclone").await.map_err(|e| match e {
-                RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                    "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
-                }
-                e => e.to_string(),
-            })?;
-            let secrets: SharedSecrets = Arc::new(KeyringStore);
+            let rcd = connected_rcd(&store).await?;
             let outcome = async {
-                // Every account is used, so every account must connect.
-                for (account, result) in manager::connect_all(&rcd, &store, &secrets).await {
-                    result.map_err(|e| format!("Account {:?}: {e}", account.label))?;
-                }
                 // A dropped sender is not a cancel request.
                 let cancelled = async {
                     if cancel_rx.await.is_err() {
@@ -181,6 +172,52 @@ impl Backend {
             outcome
         });
         StoreJob {
+            events,
+            cancel,
+            result,
+        }
+    }
+
+    /// Downloads `path` (a file or a folder, as stored) into `out`, following
+    /// the core's rules: nothing local is overwritten, sizes are checked.
+    pub fn download(&self, path: String, out: PathBuf) -> DownloadJob {
+        let (tx, events) = unbounded_channel();
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let index = Arc::clone(&self.index);
+        let result = self.runtime.spawn(async move {
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let accounts = store.list().to_vec();
+            if accounts.is_empty() {
+                return Err("Connect a Mega account first.".to_owned());
+            }
+            let rcd = connected_rcd(&store).await?;
+            let outcome = async {
+                // A dropped sender is not a cancel request.
+                let cancelled = async {
+                    if cancel_rx.await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let mut observer = |progress| {
+                    let _ = tx.send(progress);
+                };
+                let download =
+                    get::get_observed(&rcd, &index, &accounts, &path, &out, &mut observer);
+                tokio::pin!(download);
+                tokio::select! {
+                    report = &mut download => {
+                        report.map(DownloadOutcome::Done).map_err(|e| e.to_string())
+                    }
+                    () = cancelled => Ok(DownloadOutcome::Cancelled),
+                }
+            }
+            .await;
+            let _ = rcd.shutdown().await;
+            outcome
+        });
+        DownloadJob {
             events,
             cancel,
             result,
@@ -269,6 +306,41 @@ pub struct StoreJob {
     /// Sending on it asks the job to stop.
     pub cancel: tokio::sync::oneshot::Sender<()>,
     pub result: JoinHandle<Result<StoreOutcome, String>>,
+}
+
+/// How a download job ended.
+pub enum DownloadOutcome {
+    Done(get::Report),
+    /// The user cancelled. Finished files stay; rclone may leave a
+    /// `.partial` temp file for the one in flight.
+    Cancelled,
+}
+
+/// A running download job: progress events, a way to cancel, then the result.
+pub struct DownloadJob {
+    pub events: UnboundedReceiver<get::Progress>,
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+    pub result: JoinHandle<Result<DownloadOutcome, String>>,
+}
+
+/// Starts rclone and defines every stored account in it. Every account is
+/// connected because any of them may hold what is needed. On failure rclone
+/// is stopped before the error is returned.
+async fn connected_rcd(store: &AccountStore) -> Result<Rcd, String> {
+    let rcd = Rcd::start("rclone").await.map_err(|e| match e {
+        RcloneError::Spawn(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            "rclone was not found. Install it and make sure it is on your PATH.".to_owned()
+        }
+        e => e.to_string(),
+    })?;
+    let secrets: SharedSecrets = Arc::new(KeyringStore);
+    for (account, result) in manager::connect_all(&rcd, store, &secrets).await {
+        if let Err(e) = result {
+            let _ = rcd.shutdown().await;
+            return Err(format!("Account {:?}: {e}", account.label));
+        }
+    }
+    Ok(rcd)
 }
 
 /// One entry of the file browser.

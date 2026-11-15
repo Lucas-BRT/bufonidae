@@ -22,11 +22,6 @@ pub fn files(n: usize) -> String {
     format!("{n} file{}", if n == 1 { "" } else { "s" })
 }
 
-/// Splits `Pics/2026/a.png` into (`Pics/2026`, `a.png`).
-pub fn split_path(path: &str) -> (&str, &str) {
-    path.rsplit_once('/').unwrap_or(("", path))
-}
-
 /// Parses a size in decimal gigabytes typed by the user (`1`, `0.5`, `2,5`)
 /// into bytes. 0 is allowed (it means "always ask").
 pub fn parse_gb(text: &str) -> Result<u64, String> {
@@ -66,11 +61,9 @@ mod tests {
     }
 
     #[test]
-    fn pluralizes_and_splits() {
+    fn pluralizes() {
         assert_eq!(files(1), "1 file");
         assert_eq!(files(0), "0 files");
-        assert_eq!(split_path("a/b/c.txt"), ("a/b", "c.txt"));
-        assert_eq!(split_path("c.txt"), ("", "c.txt"));
     }
 
     #[test]
