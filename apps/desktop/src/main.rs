@@ -4,13 +4,22 @@ mod app;
 mod backend;
 mod browse;
 mod check;
+mod commands;
+mod distribution;
 mod download;
 mod files;
 mod format;
+mod interaction;
+mod motion;
+mod notifications;
+mod preferences;
 mod remove_account;
 mod settings;
+mod storage;
 mod store;
 mod theme;
+mod transfers;
+mod tray;
 mod tree;
 
 use std::sync::Arc;
@@ -27,12 +36,26 @@ fn main() {
     // The index is opened before any window exists, so that a second copy of
     // the app can say so instead of failing halfway.
     let backend = Backend::open().map(Arc::new);
+    let saved_config = bufonidae_core::config::Config::default_path()
+        .and_then(bufonidae_core::config::Config::load)
+        .ok();
+    let desktop_options = saved_config
+        .as_ref()
+        .map(|config| config.desktop().clone())
+        .unwrap_or_default();
+    let reduced_motion = saved_config
+        .as_ref()
+        .is_some_and(|config| config.reduced_motion());
 
     Application::new()
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx| {
             gpui_component::init(cx);
             theme::install(cx);
+            preferences::apply(desktop_options.clone(), cx);
+            cx.set_global(motion::Preferences {
+                reduced: reduced_motion,
+            });
 
             let bounds = Bounds::centered(None, size(px(1040.0), px(680.0)), cx);
             cx.open_window(
