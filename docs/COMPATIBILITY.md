@@ -20,10 +20,17 @@ and must not be advertised as supported.
 
 ## Notes
 
+- Optional desktop tray integration uses StatusNotifierItem (`ksni = 0.3.7`).
+  A compatible watcher is required; GNOME may need an AppIndicator extension.
+  Overlay badges depend on the shell. Missing support is reported in Settings
+  with Retry. The application must remain open; closing exits it.
 - The Linux file dialog offers files or folders, never both, so the desktop app
   has its own file browser. Downloads use the system folder dialog.
 - The rclone version is **enforced**: `Rcd::start` runs `rclone version` first and
   refuses anything older than 1.76.0 (the only tested release) or a pre-release
   build. For development only, `BUFONIDAE_ALLOW_UNTESTED_RCLONE=1` waives that.
   A test keeps the version in `ci.yml` and the one in the code identical.
-- Mega hands out no content hash through rclone; integrity is size only.
+- Mega hands out no content hash through rclone. Bufonidae records a local
+  BLAKE3 hash during upload and checks it on downloads and repaired copies;
+  remote reconciliation still checks size only. `verify` downloads indexed
+  replicas for an explicit deep check. Adopted files may have no hash.
