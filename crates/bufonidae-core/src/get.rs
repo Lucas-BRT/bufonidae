@@ -121,6 +121,43 @@ pub async fn get_observed<R: RemoteFs>(
         .into_iter()
         .filter(|f| is_under(&f.path, path))
         .collect();
+    download_indexed(remote, files, accounts, path, out, observer).await
+}
+
+/// Download a selection while preserving complete virtual paths. A selected
+/// parent subsumes selected descendants, so files are never attempted twice.
+pub async fn get_selected_observed<R: RemoteFs>(
+    remote: &R,
+    index: &Index,
+    accounts: &[Account],
+    paths: &[String],
+    out: &Path,
+    observer: &mut (dyn FnMut(Progress) + Send),
+) -> Result<Report, Error> {
+    if paths.is_empty()
+        || paths
+            .iter()
+            .any(|path| !crate::paths::is_safe_stored_path(path))
+    {
+        return Err(Error::NotFound("invalid or empty selection".into()));
+    }
+    let files = index
+        .list("")
+        .await?
+        .into_iter()
+        .filter(|file| paths.iter().any(|path| is_under(&file.path, path)))
+        .collect();
+    download_indexed(remote, files, accounts, "", out, observer).await
+}
+
+async fn download_indexed<R: RemoteFs>(
+    remote: &R,
+    files: Vec<IndexedFile>,
+    accounts: &[Account],
+    path: &str,
+    out: &Path,
+    observer: &mut (dyn FnMut(Progress) + Send),
+) -> Result<Report, Error> {
     if files.is_empty() {
         return Err(Error::NotFound(path.to_owned()));
     }
@@ -414,6 +451,53 @@ mod tests {
             plant_at: None,
         };
         (index, fake)
+    }
+
+    #[tokio::test]
+    async fn multiple_selection_preserves_paths_and_downloads_parent_children_once() {
+        let (index, remote) = indexed(&[
+            ("Photos/a.bin", 4, &["a"]),
+            ("Photos/nested/b.bin", 5, &["a"]),
+            ("Other/a.bin", 6, &["a"]),
+            ("Unused/file", 7, &["a"]),
+        ])
+        .await;
+        let out = tempfile::tempdir().unwrap();
+        let accounts = [account("a")];
+        let mut planned = 0;
+        let report = get_selected_observed(
+            &remote,
+            &index,
+            &accounts,
+            &["Photos".into(), "Photos/a.bin".into(), "Other/a.bin".into()],
+            out.path(),
+            &mut |event| {
+                if let Progress::Planned { files, .. } = event {
+                    planned = files;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(report.downloaded.len(), 3);
+        assert_eq!(planned, 3);
+        assert!(out.path().join("Photos/a.bin").is_file());
+        assert!(out.path().join("Photos/nested/b.bin").is_file());
+        assert!(out.path().join("Other/a.bin").is_file());
+        assert!(!out.path().join("Unused").exists());
+        assert!(
+            get_selected_observed(
+                &remote,
+                &index,
+                &accounts,
+                &["../Photos".into()],
+                out.path(),
+                &mut |_| {}
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
