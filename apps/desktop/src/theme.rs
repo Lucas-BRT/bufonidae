@@ -22,4 +22,6 @@ pub fn install(cx: &mut App) {
 /// Applies the variant that matches the system, now and whenever it changes.
 pub fn follow_system(window: &mut Window, cx: &mut App) {
     Theme::sync_system_appearance(Some(window), cx);
+    let options = crate::preferences::current(cx);
+    Theme::global_mut(cx).font_size = gpui::px(f32::from(options.text_size));
 }
