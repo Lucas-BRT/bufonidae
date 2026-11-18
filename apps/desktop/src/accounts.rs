@@ -1,10 +1,14 @@
 //! The Accounts screen: each connected account, how full it is, and the
 //! actions on it (sign in again, remove).
 
-use gpui::{Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
+use crate::interaction::{ControlFeedback as _, button};
+
+use gpui::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
     progress::Progress,
 };
 
@@ -33,15 +37,16 @@ impl BufonidaeApp {
         );
 
         let checking = matches!(self.health, Health::Checking);
-        let add_button = Button::new("add-account")
+        let add_button = button("add-account")
             .primary()
             .icon(IconName::Plus)
             .label("Add account")
             .on_click(cx.listener(|this, _, window, cx| this.open_add_account(window, cx)));
-        let check_button = Button::new("check-accounts")
+        let check_button = button("check-accounts")
             .icon(IconName::LoaderCircle)
             .label(if checking { "Checking…" } else { "Check" })
-            .loading(checking)
+            .loading(checking && crate::motion::enabled(cx))
+            .disabled_feedback(checking)
             .tooltip("Ask each account how much space it has")
             .on_click(cx.listener(|this, _, _, cx| this.check_health(cx)));
 
@@ -145,9 +150,10 @@ impl BufonidaeApp {
             );
             let actions = div()
                 .h_flex()
+                .flex_none()
                 .gap_1()
                 .child(
-                    Button::new(("reauth", i))
+                    button(("reauth", i))
                         .ghost()
                         .compact()
                         .label("Sign in again")
@@ -156,11 +162,13 @@ impl BufonidaeApp {
                         })),
                 )
                 .child(
-                    Button::new(("remove", i))
+                    button(("remove", i))
                         .ghost()
                         .compact()
                         .label("Remove")
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_remove(&id, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_remove(&id, window, cx)
+                        })),
                 );
 
             div()
@@ -179,6 +187,7 @@ impl BufonidaeApp {
                         .child(
                             div()
                                 .size_10()
+                                .flex_none()
                                 .rounded_full()
                                 .bg(accent_bg)
                                 .text_color(accent_fg)
@@ -193,7 +202,7 @@ impl BufonidaeApp {
                                 .v_flex()
                                 .flex_1()
                                 .min_w(px(0.0))
-                                .child(div().font_medium().child(account.label.clone()))
+                                .child(div().truncate().font_medium().child(account.label.clone()))
                                 .child(
                                     div()
                                         .truncate()
@@ -206,9 +215,9 @@ impl BufonidaeApp {
                             "{} · {}",
                             format::files(count),
                             format::bytes(bytes)
-                        )))
-                        .child(actions),
+                        ))),
                 )
+                .child(div().h_flex().justify_end().child(actions))
                 .children(health_line)
         });
 
@@ -217,7 +226,14 @@ impl BufonidaeApp {
             .size_full()
             .child(header)
             .children(banner)
-            .child(div().v_flex().gap_3().px_6().pb_6().children(rows))
+            .child(
+                div()
+                    .id("accounts-body")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(div().v_flex().gap_3().px_6().pb_6().children(rows)),
+            )
     }
 }
 

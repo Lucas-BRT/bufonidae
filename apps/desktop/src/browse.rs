@@ -2,18 +2,18 @@
 //! system file dialog on Linux offers either files or folders, never both, so
 //! the app has its own.
 
+use crate::interaction::{ControlFeedback as _, button, checkbox};
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
     Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px, uniform_list,
+    Styled as _, Window, div, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    checkbox::Checkbox,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
 use crate::backend::{Backend, DirEntryInfo, home_dir};
@@ -28,6 +28,8 @@ pub enum BrowseEvent {
 pub struct BrowseForm {
     backend: Arc<Backend>,
     dir: PathBuf,
+    requested_dir: PathBuf,
+    request_generation: u64,
     entries: Vec<DirEntryInfo>,
     selected: BTreeSet<PathBuf>,
     show_hidden: bool,
@@ -43,6 +45,8 @@ impl BrowseForm {
         let mut form = Self {
             backend,
             dir: start.clone(),
+            requested_dir: start.clone(),
+            request_generation: 0,
             entries: Vec::new(),
             selected: BTreeSet::new(),
             show_hidden: false,
@@ -56,6 +60,10 @@ impl BrowseForm {
     /// Shows `dir`. On failure the current folder stays and the error shows.
     fn open(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.loading = true;
+        self.error = None;
+        self.requested_dir = dir.clone();
+        self.request_generation += 1;
+        let generation = self.request_generation;
         cx.notify();
         let job = self.backend.list_dir(dir.clone());
         cx.spawn(async move |this, cx| {
@@ -64,6 +72,9 @@ impl BrowseForm {
                 Err(join_error) => Err(join_error.to_string()),
             };
             this.update(cx, |this, cx| {
+                if this.request_generation != generation {
+                    return;
+                }
                 this.loading = false;
                 match result {
                     Ok(entries) => {
@@ -107,7 +118,7 @@ impl BrowseForm {
 }
 
 impl Render for BrowseForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, danger, border, surface) = (
             theme.muted_foreground,
@@ -138,6 +149,7 @@ impl Render for BrowseForm {
                         };
                         let row = div()
                             .id(("entry", i))
+                            .w_full()
                             .h(px(ROW_HEIGHT))
                             .px_3()
                             .h_flex()
@@ -148,10 +160,11 @@ impl Render for BrowseForm {
                         if entry.is_symlink {
                             // Shown, not selectable: links are never followed.
                             return row
-                                .child(Icon::new(icon).text_color(muted))
+                                .child(Icon::new(icon).flex_none().text_color(muted))
                                 .child(
                                     div()
                                         .flex_1()
+                                        .min_w(px(0.0))
                                         .truncate()
                                         .text_color(muted)
                                         .child(format!("{} (link, not stored)", entry.name)),
@@ -159,48 +172,62 @@ impl Render for BrowseForm {
                                 .into_any_element();
                         }
                         let checkbox =
-                            Checkbox::new(("pick", i))
+                            checkbox(gpui::SharedString::from(format!("pick-{:?}", entry.path)))
+                                .label(entry.name.clone())
                                 .checked(chosen)
+                                .w_full()
+                                .min_w(px(0.0))
                                 .on_click(cx.listener({
                                     let path = path.clone();
                                     move |this, _: &bool, _, cx| this.toggle(path.clone(), cx)
                                 }));
-                        let name = div()
-                            .id(("name", i))
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .cursor_pointer()
-                            .child(entry.name.clone())
-                            .on_click(cx.listener({
-                                let (path, is_dir) = (path.clone(), entry.is_dir);
-                                move |this, _, _, cx| {
-                                    // A folder opens; a file toggles, so a click
-                                    // anywhere on a file row picks it.
-                                    if is_dir {
-                                        this.open(path.clone(), cx);
-                                    } else {
-                                        this.toggle(path.clone(), cx);
-                                    }
-                                }
-                            }));
-                        row.child(checkbox)
-                            .child(Icon::new(icon).text_color(muted))
-                            .child(name)
-                            .children(
-                                entry
-                                    .is_dir
-                                    .then(|| Icon::new(IconName::ChevronRight).text_color(muted)),
+                        let open = entry.is_dir.then(|| {
+                            button(gpui::SharedString::from(format!("open-{:?}", entry.path)))
+                                .ghost()
+                                .compact()
+                                .flex_none()
+                                .label("Open")
+                                .tooltip(format!("Open {}", entry.name))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)),
+                                )
+                        });
+                        row.child(Icon::new(icon).flex_none().text_color(muted))
+                            // Checkbox renders an outer wrapper: flex growth must
+                            // belong to this direct child of the row instead.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .child(checkbox),
                             )
+                            .children(open)
+                            .children(entry.is_dir.then(|| {
+                                Icon::new(IconName::ChevronRight)
+                                    .flex_none()
+                                    .text_color(muted)
+                            }))
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
             }),
         )
+        .w_full()
         .h(px(300.0));
 
-        let body = if let Some(message) = &self.error {
+        let body = if self.loading {
             div()
+                .w_full()
+                .h(px(300.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(crate::motion::activity("Reading folder", cx))
+                .into_any_element()
+        } else if let Some(message) = &self.error {
+            div()
+                .w_full()
                 .h(px(300.0))
                 .h_flex()
                 .items_start()
@@ -209,10 +236,24 @@ impl Render for BrowseForm {
                 .text_sm()
                 .text_color(danger)
                 .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                .child(div().flex_1().child(message.clone()))
+                .child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .gap_3()
+                        .child(message.clone())
+                        .child(
+                            button("retry-folder")
+                                .label("Retry reading folder")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open(this.requested_dir.clone(), cx)
+                                })),
+                        ),
+                )
                 .into_any_element()
         } else if count == 0 {
             div()
+                .w_full()
                 .h(px(300.0))
                 .flex()
                 .items_center()
@@ -231,6 +272,7 @@ impl Render for BrowseForm {
         div()
             .v_flex()
             .w(px(560.0))
+            .max_w(window.viewport_size().width - px(32.0))
             .gap_3()
             .p_6()
             .rounded(px(14.0))
@@ -241,6 +283,7 @@ impl Render for BrowseForm {
             .child(
                 div()
                     .v_flex()
+                    .w_full()
                     .gap_1()
                     .child(
                         div()
@@ -249,21 +292,22 @@ impl Render for BrowseForm {
                             .child("Add files or folders"),
                     )
                     .child(
-                        div().text_color(muted).child(
-                            "Tick what you want to store. Click a folder's name to open it.",
-                        ),
+                        div()
+                            .text_color(muted)
+                            .child("Tick what you want to store. Use Open to browse a folder."),
                     ),
             )
             .child(
                 div()
                     .h_flex()
+                    .w_full()
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("up")
+                        button("up")
                             .icon(IconName::ArrowUp)
                             .label("Up")
-                            .disabled(parent.is_none())
+                            .disabled_feedback(parent.is_none() || self.loading)
                             .on_click(cx.listener({
                                 let parent = parent.clone();
                                 move |this, _, _, cx| {
@@ -283,7 +327,7 @@ impl Render for BrowseForm {
                             .child(self.dir.display().to_string()),
                     )
                     .child(
-                        Checkbox::new("hidden")
+                        checkbox("hidden")
                             .label("Show hidden")
                             .checked(self.show_hidden)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -294,6 +338,7 @@ impl Render for BrowseForm {
             )
             .child(
                 div()
+                    .w_full()
                     .rounded(px(10.0))
                     .border_1()
                     .border_color(border)
@@ -303,6 +348,7 @@ impl Render for BrowseForm {
             .child(
                 div()
                     .h_flex()
+                    .w_full()
                     .items_center()
                     .justify_between()
                     .child(div().text_color(muted).child(match selected_count {
@@ -314,15 +360,15 @@ impl Render for BrowseForm {
                             .h_flex()
                             .gap_2()
                             .child(
-                                Button::new("cancel")
+                                button("cancel")
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                             )
                             .child(
-                                Button::new("choose")
+                                button("choose")
                                     .primary()
                                     .label("Add selected")
-                                    .disabled(selected_count == 0)
+                                    .disabled_feedback(selected_count == 0)
                                     .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
                             ),
                     ),

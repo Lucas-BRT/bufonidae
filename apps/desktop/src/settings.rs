@@ -2,21 +2,25 @@
 //! large upload. Values come from the saved settings; if they cannot be read,
 //! that is shown instead of pretending the defaults are what is saved.
 
+mod options;
+
+use crate::interaction::{ControlFeedback as _, button, checkbox};
+
 use std::sync::Arc;
 
 use bufonidae_core::config::{self, Config};
 use gpui::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, Window,
-    div, px,
+    AnyElement, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, Selectable as _, StyledExt as _,
+    button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
 };
 
 use crate::backend::{Backend, RedundancyChange};
-use crate::format;
+use crate::{format, motion};
 
 /// Levels offered as buttons. Higher ones exist (`bufonidae redundancy`).
 const LEVELS: [u8; 3] = [1, 2, 3];
@@ -38,6 +42,12 @@ pub struct SettingsView {
     rule_folder: Entity<InputState>,
     rule_copies: u8,
     redundancy_status: Status,
+    motion_status: Status,
+    feedback_revision: usize,
+    desktop_draft: config::DesktopOptions,
+    desktop_status: Status,
+    notification_feedback: Option<String>,
+    notification_testing: bool,
 }
 
 impl SettingsView {
@@ -47,6 +57,9 @@ impl SettingsView {
         cx.subscribe(&limit, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.save_limit(cx);
+            } else if matches!(event, InputEvent::Change) && !this.saving() {
+                this.limit_status = Status::Idle;
+                cx.notify();
             }
         })
         .detach();
@@ -59,7 +72,30 @@ impl SettingsView {
         })
         .detach();
 
-        let job = backend.load_config();
+        let mut view = Self {
+            backend,
+            config: None,
+            load_error: None,
+            limit,
+            limit_status: Status::Idle,
+            rule_folder,
+            rule_copies: 2,
+            redundancy_status: Status::Idle,
+            motion_status: Status::Idle,
+            feedback_revision: 0,
+            desktop_draft: config::DesktopOptions::default(),
+            desktop_status: Status::Idle,
+            notification_feedback: None,
+            notification_testing: false,
+        };
+        view.load(window, cx);
+        view
+    }
+
+    fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_error = None;
+        self.config = None;
+        let job = self.backend.load_config();
         cx.spawn_in(window, async move |this, cx| {
             let result = match job.await {
                 Ok(result) => result,
@@ -71,6 +107,11 @@ impl SettingsView {
                         let text = format::gb_text(config.large_upload_bytes());
                         this.limit
                             .update(cx, |field, cx| field.set_value(text, window, cx));
+                        cx.set_global(motion::Preferences {
+                            reduced: config.reduced_motion(),
+                        });
+                        this.desktop_draft = config.desktop().clone();
+                        crate::preferences::apply(config.desktop().clone(), cx);
                         this.config = Some(config);
                     }
                     Err(message) => this.load_error = Some(message),
@@ -81,21 +122,50 @@ impl SettingsView {
         })
         .detach();
 
-        Self {
-            backend,
-            config: None,
-            load_error: None,
-            limit,
-            limit_status: Status::Idle,
-            rule_folder,
-            rule_copies: 2,
-            redundancy_status: Status::Idle,
+        cx.notify();
+    }
+
+    fn saving(&self) -> bool {
+        matches!(self.limit_status, Status::Saving)
+            || matches!(self.redundancy_status, Status::Saving)
+            || matches!(self.motion_status, Status::Saving)
+            || matches!(self.desktop_status, Status::Saving)
+    }
+
+    fn save_motion(&mut self, reduced: bool, cx: &mut Context<Self>) {
+        if self.config.is_none() || self.saving() {
+            return;
         }
+        self.feedback_revision += 1;
+        self.motion_status = Status::Saving;
+        cx.notify();
+        let job = self.backend.save_reduced_motion(reduced);
+        cx.spawn(async move |this, cx| {
+            let result = match job.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(config) => {
+                        cx.set_global(motion::Preferences {
+                            reduced: config.reduced_motion(),
+                        });
+                        this.config = Some(config);
+                        this.motion_status = Status::Saved;
+                    }
+                    Err(error) => this.motion_status = Status::Invalid(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn save_limit(&mut self, cx: &mut Context<Self>) {
         // Never write over settings that were not read successfully.
-        if self.config.is_none() {
+        if self.config.is_none() || self.saving() {
             return;
         }
         let text = self.limit.read(cx).value();
@@ -107,6 +177,14 @@ impl SettingsView {
                 return;
             }
         };
+        if self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.large_upload_bytes() == bytes)
+        {
+            return;
+        }
+        self.feedback_revision += 1;
         self.limit_status = Status::Saving;
         cx.notify();
         let job = self.backend.save_large_upload_bytes(bytes);
@@ -117,7 +195,10 @@ impl SettingsView {
             };
             this.update(cx, |this, cx| {
                 this.limit_status = match result {
-                    Ok(()) => Status::Saved,
+                    Ok(config) => {
+                        this.config = Some(config);
+                        Status::Saved
+                    }
                     Err(message) => Status::Invalid(message),
                 };
                 cx.notify();
@@ -128,9 +209,10 @@ impl SettingsView {
     }
 
     fn change(&mut self, change: RedundancyChange, cx: &mut Context<Self>) {
-        if self.config.is_none() {
+        if self.config.is_none() || self.saving() {
             return;
         }
+        self.feedback_revision += 1;
         self.redundancy_status = Status::Saving;
         cx.notify();
         let job = self.backend.change_redundancy(change);
@@ -142,6 +224,9 @@ impl SettingsView {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(config) => {
+                        cx.set_global(motion::Preferences {
+                            reduced: config.reduced_motion(),
+                        });
                         this.config = Some(config);
                         this.redundancy_status = Status::Saved;
                     }
@@ -170,23 +255,26 @@ fn status_line(
     status: &Status,
     muted: gpui::Hsla,
     danger: gpui::Hsla,
+    revision: usize,
+    cx: &gpui::App,
 ) -> Option<impl IntoElement + use<>> {
     match status {
         Status::Idle => None,
-        Status::Saving => Some(
+        Status::Saving => Some(motion::activity("Saving settings", cx)),
+        Status::Saved => Some(motion::fade(
             div()
+                .h_flex()
+                .gap_2()
+                .items_center()
                 .text_sm()
                 .text_color(muted)
-                .child("Saving…")
-                .into_any_element(),
-        ),
-        Status::Saved => Some(
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child("Saved.")
-                .into_any_element(),
-        ),
+                .child(Icon::new(IconName::CircleCheck).size_4())
+                .child("Saved on this device."),
+            ("settings-saved", revision),
+            false,
+            1.0,
+            cx,
+        )),
         Status::Invalid(message) => Some(
             div()
                 .h_flex()
@@ -211,18 +299,28 @@ impl Render for SettingsView {
             theme.border,
             theme.popover,
         );
-        let card = || {
+        // Use normal block flow for auto-height cards. Nested flex columns can
+        // size wrapped text before its final width is known and undercount it.
+        let card = |children: Vec<AnyElement>| {
             div()
-                .v_flex()
-                .gap_3()
+                .block()
+                .w_full()
                 .max_w(px(560.0))
+                .mb_4()
                 .p_5()
                 .rounded(px(12.0))
                 .bg(surface)
                 .border_1()
                 .border_color(border)
+                .children(children.into_iter().enumerate().map(|(i, child)| {
+                    div()
+                        .block()
+                        .pt(if i == 0 { px(0.0) } else { px(12.0) })
+                        .child(child)
+                }))
         };
         let header = div()
+            .flex_none()
             .px_6()
             .pt_6()
             .pb_4()
@@ -230,47 +328,50 @@ impl Render for SettingsView {
 
         if let Some(message) = &self.load_error {
             return div().v_flex().size_full().child(header).child(
-                div().px_6().child(
-                    div()
-                        .h_flex()
-                        .items_start()
-                        .gap_2()
-                        .text_color(danger)
+                div().px_6().v_flex().gap_3()
+                    .child(div().h_flex().items_start().gap_2().text_color(danger)
                         .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                        .child(div().flex_1().child(format!(
-                            "The saved settings could not be read, so they are not shown or \
-                             changed: {message}"
-                        ))),
-                ),
+                        .child(div().flex_1().child(format!("The saved settings could not be read, so they are not shown or changed: {message}"))))
+                    .child(button("retry-settings").label("Retry loading settings")
+                        .on_click(cx.listener(|this, _, window, cx| this.load(window, cx)))),
             );
         }
         let Some(current) = self.config.clone() else {
-            return div()
-                .v_flex()
-                .size_full()
-                .child(header)
-                .child(div().px_6().text_color(muted).child("Loading…"));
+            return div().v_flex().size_full().child(header).child(
+                div()
+                    .px_6()
+                    .text_color(muted)
+                    .child(motion::activity("Loading settings", cx)),
+            );
         };
 
+        let saving = self.saving();
         // Level buttons: the chosen one is filled.
         let level_buttons =
             |id: &'static str,
              chosen: u8,
              cx: &mut Context<Self>,
              on_pick: fn(&mut Self, u8, &mut Context<Self>)| {
-                div().h_flex().gap_1().children(LEVELS.iter().map(|&n| {
-                    let button = Button::new((id, usize::from(n)))
-                        .label(match n {
-                            1 => "1 copy".to_owned(),
-                            n => format!("{n} copies"),
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| on_pick(this, n, cx)));
-                    if n == chosen {
-                        button.primary()
-                    } else {
-                        button
-                    }
-                }))
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .children(LEVELS.iter().map(|&n| {
+                        let button = button((id, usize::from(n)))
+                            .min_w(px(108.0))
+                            .selected(n == chosen)
+                            .disabled_feedback(saving)
+                            .label(match n {
+                                1 => "1 copy".to_owned(),
+                                n => format!("{n} copies"),
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| on_pick(this, n, cx)));
+                        if n == chosen {
+                            button.primary().icon(IconName::CircleCheck)
+                        } else {
+                            button
+                        }
+                    }))
             };
 
         let default_picker = level_buttons(
@@ -300,63 +401,109 @@ impl Render for SettingsView {
                             .truncate()
                             .child(bufonidae_rclone::escape_control(folder)),
                     )
-                    .child(div().text_color(muted).child(config::describe(copies)))
                     .child(
-                        Button::new(("drop-rule", i))
+                        div()
+                            .flex_none()
+                            .text_color(muted)
+                            .child(config::describe(copies)),
+                    )
+                    .child(
+                        button(("drop-rule", i))
                             .ghost()
                             .compact()
                             .label("Remove")
+                            .disabled_feedback(saving)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.change(RedundancyChange::RemoveRule(name.clone()), cx);
                             })),
                     )
             });
 
+        let rule_editor = div()
+            .block()
+            .child(
+                div()
+                    .h_8()
+                    .mb_2()
+                    .child(Input::new(&self.rule_folder).disabled(saving)),
+            )
+            .child(div().mb_2().child(rule_picker))
+            .child(
+                button("add-rule")
+                    .label("Add rule")
+                    .disabled_feedback(saving)
+                    .on_click(cx.listener(|this, _, _, cx| this.add_rule(cx))),
+            );
+
         div().v_flex().size_full().child(header).child(
             div()
-                .v_flex()
-                .gap_4()
+                .id("settings-body")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
                 .px_6()
                 .pb_6()
-                .child(
-                    card()
-                        .child(div().font_semibold().child("Copies of each file"))
-                        .child(div().text_color(muted).child(
-                            "Each copy goes on a different account, so more copies survive \
-                                 losing an account but use more space. This applies to files \
-                                 stored from now on; use Check to bring existing files up to it.",
-                        ))
-                        .child(default_picker)
-                        .child(div().h_px().bg(border))
-                        .child(div().font_medium().child("Folders with their own rule"))
-                        .child(div().v_flex().gap_2().children(rules))
+                .child(card(vec![
+                    div()
+                        .font_semibold()
+                        .child("Copies of each file")
+                        .into_any_element(),
+                    div()
+                        .text_color(muted)
                         .child(
-                            div()
-                                .h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().flex_1().child(Input::new(&self.rule_folder)))
-                                .child(rule_picker)
-                                .child(Button::new("add-rule").label("Add rule").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_rule(cx);
-                                    }),
-                                )),
+                            "Each copy goes on a different account, so more copies survive \
+                         losing an account but use more space. This applies to files \
+                         stored from now on; use Check to bring existing files up to it.",
                         )
-                        .children(status_line(&self.redundancy_status, muted, danger)),
-                )
-                .child(
-                    card()
-                        .child(div().font_semibold().child("Large uploads"))
-                        .child(div().text_color(muted).child(
+                        .into_any_element(),
+                    default_picker.into_any_element(),
+                    div().text_sm().text_color(muted).child(if current.default_copies() == 1 { "Current default: 1 copy per file".to_owned() } else { format!("Current default: {} copies per file", current.default_copies()) }).into_any_element(),
+                    div().h_px().bg(border).into_any_element(),
+                    div()
+                        .font_medium()
+                        .child("Folders with their own rule")
+                        .into_any_element(),
+                    div()
+                        .block()
+                        .children(rules.map(|row| div().mb_2().child(row)))
+                        .into_any_element(),
+                    rule_editor.into_any_element(),
+                    div()
+                        .children(status_line(&self.redundancy_status, muted, danger, self.feedback_revision, cx))
+                        .into_any_element(),
+                ]))
+                .child(card(vec![
+                    div()
+                        .font_semibold()
+                        .child("Large uploads")
+                        .into_any_element(),
+                    div()
+                        .text_color(muted)
+                        .child(
                             "Ask for confirmation before storing more than this in one go. \
-                                 Dropping your whole home folder always asks. Set 0 to always ask.",
-                        ))
-                        .child(div().w(px(200.0)).child(
-                            Input::new(&self.limit).suffix(div().text_color(muted).child("GB")),
-                        ))
-                        .children(status_line(&self.limit_status, muted, danger)),
-                ),
+                         Dropping your whole home folder always asks. Set 0 to always ask.",
+                        )
+                        .into_any_element(),
+                    div().text_sm().text_color(muted).child("Enter a size in GB. Press Enter or leave the field to save.").into_any_element(),
+                    div()
+                        .w(px(200.0))
+                        .h_8()
+                        .child(Input::new(&self.limit).disabled(saving).suffix(div().text_color(muted).child("GB")))
+                        .into_any_element(),
+                    div()
+                        .children(status_line(&self.limit_status, muted, danger, self.feedback_revision, cx))
+                        .into_any_element(),
+                ]))
+                .child(card(vec![
+                    div().font_semibold().child("Motion and feedback").into_any_element(),
+                    checkbox("reduced-motion").label("Reduce motion")
+                        .checked(current.reduced_motion()).disabled_feedback(saving)
+                        .on_click(cx.listener(|this, reduced: &bool, _, cx| this.save_motion(*reduced, cx)))
+                        .into_any_element(),
+                    div().text_color(muted).child("Disable application fades, progress smoothing and pulsing activity indicators. Status text remains visible. This preference is saved on this device.").into_any_element(),
+                    div().children(status_line(&self.motion_status, muted, danger, self.feedback_revision, cx)).into_any_element(),
+                ]))
+                .child(self.desktop_panel(cx)),
         )
     }
 }
