@@ -69,6 +69,12 @@ enum Command {
         #[arg(long, default_value = "")]
         prefix: String,
     },
+    /// Download each replica and compare it with its recorded BLAKE3 hash.
+    Verify {
+        /// Only this folder (default: everything).
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
     /// How many copies of each file to keep, like a RAID level.
     #[command(subcommand)]
     Redundancy(RedundancyCommand),
@@ -206,6 +212,43 @@ async fn main() -> Result<()> {
                     config.unset(&folder)?;
                     println!("removed the rule of {}", show(&folder));
                 }
+            }
+        }
+        Command::Verify { prefix } => {
+            let index = Index::open(&Index::default_path()?).await?;
+            let files = index.list(&prefix).await?;
+            let bytes =
+                files
+                    .iter()
+                    .filter(|file| file.blake3.is_some())
+                    .fold(0u64, |total, file| {
+                        total.saturating_add(file.size.saturating_mul(file.accounts.len() as u64))
+                    });
+            eprintln!(
+                "Deep verification downloads indexed replicas (up to {bytes} bytes); it never changes remote files or trusted hashes."
+            );
+            let rcd = Rcd::start(bufonidae_rclone::locate()).await?;
+            let accounts = sign_in(&rcd, &store, &secrets).await;
+            let result = bufonidae_core::verify::verify(&rcd, &index, &accounts, &prefix).await;
+            rcd.shutdown().await?;
+            let report = result?;
+            println!(
+                "verified {} copies ({} bytes)",
+                report.verified, report.bytes
+            );
+            for path in &report.without_hash {
+                eprintln!("NO HASH     {}", show(path));
+            }
+            for (path, account, reason) in &report.failed {
+                eprintln!(
+                    "UNVERIFIED  {} on {}: {}",
+                    show(path),
+                    show(account),
+                    show(reason)
+                );
+            }
+            if !report.failed.is_empty() || !report.without_hash.is_empty() {
+                bail!("content verification is incomplete; see the reported copies and files");
             }
         }
         Command::Repair { prefix } => {

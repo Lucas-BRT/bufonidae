@@ -16,6 +16,9 @@ fn describe(command: &str) -> &'static str {
             "Compare the index with the accounts; a dry run unless --apply, and only the index changes."
         }
         "repair" => "Rebuild missing copies of files that have fewer than the redundancy asks for.",
+        "verify" => {
+            "Download every indexed replica and verify its recorded BLAKE3 hash; files without a hash are reported separately."
+        }
         "redundancy" => "Show or set how many copies each file gets (show, set, unset).",
         "export" => "Write a portable backup (no passwords) to a JSON file.",
         "import" => "Restore a backup into an empty profile.",
