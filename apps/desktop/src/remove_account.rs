@@ -1,13 +1,14 @@
 //! The "Remove account" confirmation: says what removing does and does not do.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use std::sync::Arc;
 
 use gpui::{
     Context, EventEmitter, IntoElement, ParentElement as _, Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
 use crate::backend::Backend;
@@ -86,7 +87,7 @@ impl RemoveForm {
 }
 
 impl Render for RemoveForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, danger, border, surface) = (
             theme.muted_foreground,
@@ -132,6 +133,7 @@ impl Render for RemoveForm {
         div()
             .v_flex()
             .w(px(460.0))
+            .max_w(window.viewport_size().width - px(32.0))
             .gap_4()
             .p_6()
             .rounded(px(14.0))
@@ -158,16 +160,17 @@ impl Render for RemoveForm {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("keep")
+                        button("keep")
                             .label("Keep it")
-                            .disabled(removing)
+                            .disabled_feedback(removing)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("remove")
+                        button("remove")
                             .danger()
                             .label("Remove account")
-                            .loading(removing)
+                            .loading(removing && crate::motion::enabled(cx))
+                            .disabled_feedback(removing)
                             .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
                     ),
             )

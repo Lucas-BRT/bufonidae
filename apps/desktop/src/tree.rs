@@ -22,6 +22,21 @@ pub enum Row {
 }
 
 impl Row {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Folder { name, .. } | Self::File { name, .. } => name,
+        }
+    }
+    pub fn bytes(&self) -> u64 {
+        match self {
+            Self::Folder { bytes, .. } => *bytes,
+            Self::File { size, .. } => *size,
+        }
+    }
+    pub fn is_folder(&self) -> bool {
+        matches!(self, Self::Folder { .. })
+    }
+
     pub fn path(&self) -> &str {
         match self {
             Self::Folder { path, .. } | Self::File { path, .. } => path,
@@ -39,6 +54,53 @@ fn join(folder: &str, name: &str) -> String {
 
 /// What `folder` directly contains: subfolders first, then files, each by
 /// name ignoring case. `folder` is `""` for the top level.
+/// Current-folder search/filter/sort projection; selection lives separately.
+pub fn visible_rows(
+    files: &[IndexedFile],
+    folder: &str,
+    query: &str,
+    sort: bufonidae_core::config::FileSort,
+    filter: bufonidae_core::config::FileFilter,
+    options: &bufonidae_core::config::DesktopOptions,
+) -> Vec<Row> {
+    use bufonidae_core::config::{FileFilter, FileSort};
+    let query = if options.case_sensitive {
+        query.to_owned()
+    } else {
+        query.to_lowercase()
+    };
+    let mut visible = rows(files, folder);
+    visible.retain(|row| {
+        let name = if options.case_sensitive {
+            row.name().to_owned()
+        } else {
+            row.name().to_lowercase()
+        };
+        name.contains(&query)
+            && match filter {
+                FileFilter::All => true,
+                FileFilter::Files => !row.is_folder(),
+                FileFilter::Folders => row.is_folder(),
+            }
+    });
+    visible.sort_by(|a, b| {
+        let group = if options.folders_first {
+            b.is_folder().cmp(&a.is_folder())
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        group
+            .then_with(|| match sort {
+                FileSort::Name => a.name().to_lowercase().cmp(&b.name().to_lowercase()),
+                FileSort::NameDescending => b.name().to_lowercase().cmp(&a.name().to_lowercase()),
+                FileSort::Size => a.bytes().cmp(&b.bytes()),
+                FileSort::SizeDescending => b.bytes().cmp(&a.bytes()),
+            })
+            .then_with(|| a.path().cmp(b.path()))
+    });
+    visible
+}
+
 pub fn rows(files: &[IndexedFile], folder: &str) -> Vec<Row> {
     let prefix = if folder.is_empty() {
         String::new()
@@ -132,6 +194,74 @@ mod tests {
             file("Photos/cover.png", 5),
             file("photos-old/x.bin", 1),
         ]
+    }
+
+    #[test]
+    fn search_filter_and_sort_respect_saved_choices_and_folder_grouping() {
+        use bufonidae_core::config::{DesktopOptions, FileFilter, FileSort};
+        let files = vec![
+            file("Zoo/child", 1),
+            file("alpha.txt", 4),
+            file("Beta.txt", 9),
+            file("écho.txt", 2),
+        ];
+        let options = DesktopOptions::default();
+        let names = |rows: Vec<Row>| {
+            rows.iter()
+                .map(|row| row.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(visible_rows(
+                &files,
+                "",
+                "",
+                FileSort::Name,
+                FileFilter::All,
+                &options
+            )),
+            ["Zoo", "alpha.txt", "Beta.txt", "écho.txt"]
+        );
+        assert_eq!(
+            names(visible_rows(
+                &files,
+                "",
+                "",
+                FileSort::SizeDescending,
+                FileFilter::Files,
+                &options
+            )),
+            ["Beta.txt", "alpha.txt", "écho.txt"]
+        );
+        assert_eq!(
+            names(visible_rows(
+                &files,
+                "",
+                "beta",
+                FileSort::Name,
+                FileFilter::All,
+                &options
+            )),
+            ["Beta.txt"]
+        );
+        let strict = DesktopOptions {
+            case_sensitive: true,
+            ..options
+        };
+        assert!(
+            visible_rows(&files, "", "beta", FileSort::Name, FileFilter::All, &strict).is_empty()
+        );
+        assert_eq!(
+            names(visible_rows(
+                &files,
+                "",
+                "",
+                FileSort::Name,
+                FileFilter::Folders,
+                &strict
+            )),
+            ["Zoo"]
+        );
     }
 
     #[test]

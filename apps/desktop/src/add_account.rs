@@ -1,6 +1,8 @@
 //! The "Add account" modal: e-mail, password, an optional 2FA code and an
 //! optional name. The login is proven against Mega before anything is saved.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use std::sync::Arc;
 
 use gpui::{
@@ -8,8 +10,8 @@ use gpui::{
     Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _,
+    button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
 };
 
@@ -114,6 +116,8 @@ impl AddAccountForm {
         if let Mode::Reauth { label, .. } = self.mode.clone() {
             if password.is_empty() {
                 self.phase = Phase::Failed("Enter your Mega password.".into());
+                self.password
+                    .update(cx, |field, cx| field.focus(window, cx));
                 cx.notify();
                 return;
             }
@@ -129,11 +133,14 @@ impl AddAccountForm {
 
         if !email.contains('@') {
             self.phase = Phase::Failed("Enter the e-mail address of your Mega account.".into());
+            self.email.update(cx, |field, cx| field.focus(window, cx));
             cx.notify();
             return;
         }
         if password.is_empty() {
             self.phase = Phase::Failed("Enter your Mega password.".into());
+            self.password
+                .update(cx, |field, cx| field.focus(window, cx));
             cx.notify();
             return;
         }
@@ -202,7 +209,7 @@ impl AddAccountForm {
 }
 
 impl Render for AddAccountForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let submitting = matches!(self.phase, Phase::Submitting);
         let theme = cx.theme();
         let (muted, danger, border, surface) = (
@@ -236,6 +243,7 @@ impl Render for AddAccountForm {
         div()
             .v_flex()
             .w(px(420.0))
+            .max_w(window.viewport_size().width - px(32.0))
             .gap_4()
             .p_6()
             .rounded(px(14.0))
@@ -280,19 +288,20 @@ impl Render for AddAccountForm {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("cancel")
+                        button("cancel")
                             .label("Cancel")
-                            .disabled(submitting)
+                            .disabled_feedback(submitting)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("connect")
+                        button("connect")
                             .primary()
                             .label(match &self.mode {
                                 Mode::New => "Connect account",
                                 Mode::Reauth { .. } => "Sign in",
                             })
-                            .loading(submitting)
+                            .loading(submitting && crate::motion::enabled(cx))
+                            .disabled_feedback(submitting)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )

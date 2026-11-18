@@ -2,14 +2,15 @@
 //! really hold, applies the safe fixes on request, and rebuilds missing
 //! copies. Nothing changes until the user presses a button that says so.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use bufonidae_core::repair;
 use gpui::{
     Context, InteractiveElement as _, IntoElement, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
 use crate::app::BufonidaeApp;
@@ -31,6 +32,8 @@ pub(crate) enum CheckState {
         repaired: Option<Box<repair::Report>>,
     },
     Failed(String),
+    Verified(Box<bufonidae_core::verify::Report>),
+    VerificationCancelled,
 }
 
 fn clean(text: &str) -> String {
@@ -113,12 +116,12 @@ impl BufonidaeApp {
                     )),
             )
             .child(
-                Button::new("check-now")
+                button("check-now")
                     .primary()
                     .icon(IconName::CircleCheck)
                     .label("Check now")
-                    .loading(running)
-                    .disabled(running)
+                    .loading(running && crate::motion::enabled(cx))
+                    .disabled_feedback(running)
                     .on_click(cx.listener(|this, _, _, cx| this.run_check(false, cx))),
             );
 
@@ -134,7 +137,7 @@ impl BufonidaeApp {
             CheckState::Running(what) => div()
                 .p_6()
                 .text_color(muted)
-                .child(format!("{what} This signs in to your accounts and can take a while."))
+                .child(crate::motion::activity(if self.verification_stopping { "Cancelling verification — waiting for it to stop" } else { what }, cx))
                 .into_any_element(),
             CheckState::Failed(message) => div()
                 .h_flex()
@@ -144,6 +147,14 @@ impl BufonidaeApp {
                 .text_color(danger)
                 .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
                 .child(div().flex_1().child(message.clone()))
+                .into_any_element(),
+            CheckState::VerificationCancelled => div().p_6().child("Content verification cancelled. No remote files or trusted hashes were changed.").into_any_element(),
+            CheckState::Verified(report) => div().v_flex().p_6().gap_4()
+                .child(format!("{} copies verified · {} · {} without a hash reference · {} failures", report.verified, format::bytes(report.bytes), report.without_hash.len(), report.failed.len()))
+                .child(group("Copies that could not be verified".into(), IconName::TriangleAlert, danger, muted,
+                    report.failed.iter().map(|(path, account, reason)| format!("{} · {}: {}", clean(path), clean(account), clean(reason))).collect(), None))
+                .child(group("Files without a trusted hash".into(), IconName::Info, muted, muted,
+                    report.without_hash.iter().map(|path| clean(path)).collect(), Some("Matching size alone does not establish content integrity.")))
                 .into_any_element(),
             CheckState::Result {
                 outcome,
@@ -291,19 +302,19 @@ impl BufonidaeApp {
                 let mut actions = div().h_flex().gap_2();
                 if r.fixable() > 0 && !*applied {
                     actions = actions.child(
-                        Button::new("apply-fixes")
+                        button("apply-fixes")
                             .primary()
                             .label("Apply fixes")
-                            .disabled(running)
+                            .disabled_feedback(running)
                             .on_click(cx.listener(|this, _, _, cx| this.run_check(true, cx))),
                     );
                 }
                 if !under.is_empty() {
                     actions = actions.child(
-                        Button::new("repair")
+                        button("repair")
                             .primary()
                             .label("Rebuild missing copies")
-                            .disabled(running)
+                            .disabled_feedback(running)
                             .on_click(cx.listener(|this, _, _, cx| this.run_repair(cx))),
                     );
                 }
@@ -334,6 +345,15 @@ impl BufonidaeApp {
             .size_full()
             .child(header)
             .child(div().h_px().bg(border))
+            .child({
+                let bytes = self.snapshot().map(|s| s.files.iter().filter(|f| f.blake3.is_some()).fold(0u64, |total, file| total.saturating_add(file.size.saturating_mul(file.accounts.len() as u64)))).unwrap_or(0);
+                div().h_flex().flex_wrap().gap_3().px_6().py_3()
+                    .child(div().text_sm().text_color(muted).child(format!("Deep check downloads up to {} of indexed copies. Files without a hash are reported separately.", format::bytes(bytes))))
+                    .child(button("deep-check").label("Download and verify contents").disabled_feedback(running)
+                        .on_click(cx.listener(|this, _, _, cx| this.run_deep_check(cx))))
+                    .children((self.verification_cancel.is_some() || self.verification_stopping).then(|| button("cancel-verification").label(if self.verification_stopping { "Cancelling…" } else { "Cancel verification" }).disabled_feedback(self.verification_stopping)
+                        .on_click(cx.listener(|this, _, _, cx| { if let Some(cancel) = this.verification_cancel.take() { let _ = cancel.send(()); this.verification_stopping = true; cx.notify(); } }))))
+            })
             .child(
                 div()
                     .id("check-body")
