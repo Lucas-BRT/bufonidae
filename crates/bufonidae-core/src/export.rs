@@ -140,6 +140,7 @@ fn safe_path(path: &str) -> bool {
 }
 
 fn validate(export: &Export) -> Result<(), Error> {
+    export.config.desktop().validate()?;
     let bad = |message: String| Err(Error::Inconsistent(message));
     let mut size_of = std::collections::HashMap::new();
     for p in &export.placements {

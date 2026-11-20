@@ -1,15 +1,17 @@
 //! The "Add account" modal: e-mail, password, an optional 2FA code and an
 //! optional name. The login is proven against Mega before anything is saved.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use std::sync::Arc;
 
 use gpui::{
     AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, div, px,
+    Styled as _, Window, div,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _,
+    button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
 };
 
@@ -114,6 +116,8 @@ impl AddAccountForm {
         if let Mode::Reauth { label, .. } = self.mode.clone() {
             if password.is_empty() {
                 self.phase = Phase::Failed("Enter your Mega password.".into());
+                self.password
+                    .update(cx, |field, cx| field.focus(window, cx));
                 cx.notify();
                 return;
             }
@@ -129,11 +133,14 @@ impl AddAccountForm {
 
         if !email.contains('@') {
             self.phase = Phase::Failed("Enter the e-mail address of your Mega account.".into());
+            self.email.update(cx, |field, cx| field.focus(window, cx));
             cx.notify();
             return;
         }
         if password.is_empty() {
             self.phase = Phase::Failed("Enter your Mega password.".into());
+            self.password
+                .update(cx, |field, cx| field.focus(window, cx));
             cx.notify();
             return;
         }
@@ -202,15 +209,10 @@ impl AddAccountForm {
 }
 
 impl Render for AddAccountForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let submitting = matches!(self.phase, Phase::Submitting);
         let theme = cx.theme();
-        let (muted, danger, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.border,
-            theme.popover,
-        );
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
 
         let status = match &self.phase {
             Phase::Editing => None,
@@ -229,20 +231,11 @@ impl Render for AddAccountForm {
                     .text_sm()
                     .text_color(danger)
                     .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                    .child(div().flex_1().child(message.clone())),
+                    .child(div().flex_1().min_w(gpui::px(0.0)).child(message.clone())),
             ),
         };
 
-        div()
-            .v_flex()
-            .w(px(420.0))
-            .gap_4()
-            .p_6()
-            .rounded(px(14.0))
-            .bg(surface)
-            .border_1()
-            .border_color(border)
-            .shadow_lg()
+        crate::ui::Dialog::new(420.0, window, cx)
             .child(
                 div()
                     .v_flex()
@@ -274,25 +267,26 @@ impl Render for AddAccountForm {
                     .then(|| self.field(cx, "Name", &self.name, submitting)),
             )
             .children(status)
-            .child(
+            .footer(
                 div()
                     .h_flex()
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("cancel")
+                        button("cancel")
                             .label("Cancel")
-                            .disabled(submitting)
+                            .disabled_feedback(submitting)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("connect")
+                        button("connect")
                             .primary()
                             .label(match &self.mode {
                                 Mode::New => "Connect account",
                                 Mode::Reauth { .. } => "Sign in",
                             })
-                            .loading(submitting)
+                            .loading(submitting && crate::motion::enabled(cx))
+                            .disabled_feedback(submitting)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )

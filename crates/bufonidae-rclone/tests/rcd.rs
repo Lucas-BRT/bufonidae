@@ -21,6 +21,49 @@ fn local(dir: &tempfile::TempDir) -> String {
 }
 
 #[tokio::test]
+async fn reports_transferred_bytes_before_a_throttled_copy_finishes() {
+    let Some(rcd) = start().await else { return };
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let size = 2 * 1024 * 1024;
+    std::fs::write(src.path().join("large.bin"), vec![42u8; size]).unwrap();
+    let _: serde_json::Value = rcd
+        .call("core/bwlimit", &serde_json::json!({"rate": "512k"}))
+        .await
+        .unwrap();
+    rcd.reset_transfer_stats().await.unwrap();
+    let source = local(&src);
+    let destination = local(&dst);
+    let mut observed_partial = false;
+    {
+        let copy = rcd.copy_file(&source, "large.bin", &destination, "large.bin");
+        tokio::pin!(copy);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                tokio::select! {
+                    result = &mut copy => { result.unwrap(); break; }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        let stats = rcd.transfer_stats().await.unwrap();
+                        observed_partial |= stats.bytes > 0 && stats.bytes < size as u64;
+                        assert!(stats.speed.is_finite() && stats.speed >= 0.0);
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        observed_partial,
+        "no live bytes were observed before completion"
+    );
+    assert_eq!(rcd.transfer_stats().await.unwrap().bytes, size as u64);
+    rcd.reset_transfer_stats().await.unwrap();
+    assert_eq!(rcd.transfer_stats().await.unwrap().bytes, 0);
+    rcd.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn lists_files_and_reports_space() {
     let Some(rcd) = start().await else { return };
     let dir = tempfile::tempdir().unwrap();
@@ -122,5 +165,52 @@ async fn a_missing_folder_is_recognised_but_a_missing_remote_is_not() {
 
     let no_remote = rcd.list("acct-undefined:", "").await.unwrap_err();
     assert!(!no_remote.is_directory_not_found(), "{no_remote}");
+    rcd.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn redistribution_calls_preserve_existing_files_and_report_staging_space() {
+    let Some(rcd) = start().await else { return };
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("file"), b"new content").unwrap();
+    std::fs::write(dst.path().join("file"), b"keep existing").unwrap();
+    let _: serde_json::Value = rcd
+        .call(
+            "operations/copyfile",
+            &serde_json::json!({
+                "srcFs":local(&src),"srcRemote":"file","dstFs":local(&dst),"dstRemote":"file",
+                "_config":{"IgnoreExisting":true}
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dst.path().join("file")).unwrap(),
+        b"keep existing"
+    );
+    let disk: serde_json::Value = rcd
+        .call("core/du", &serde_json::json!({"dir":dst.path()}))
+        .await
+        .unwrap();
+    assert!(disk["info"]["Available"].as_u64().is_some());
+    let rate: serde_json::Value = rcd
+        .call(
+            "core/bwlimit",
+            &serde_json::json!({"rate":"125000B:250000B"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rate["bytesPerSecondTx"], 125000);
+    assert_eq!(rate["bytesPerSecondRx"], 250000);
+    let _: serde_json::Value = rcd
+        .call(
+            "operations/deletefile",
+            &serde_json::json!({"fs":local(&dst),"remote":"file"}),
+        )
+        .await
+        .unwrap();
+    assert!(!dst.path().join("file").exists());
+    assert!(src.path().join("file").exists());
     rcd.shutdown().await.unwrap();
 }

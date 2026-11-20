@@ -14,6 +14,10 @@ pub const MAX_COPIES: u8 = 8;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
+        "desktop settings: text size must be 12..20 px and notification duration 1..30 seconds"
+    )]
+    InvalidDesktop,
+    #[error(
         "invalid level {0:?}: use `single`, `mirror` (2 copies) or `mirror:N` with N from 2 to {MAX_COPIES}"
     )]
     InvalidLevel(String),
@@ -55,6 +59,102 @@ fn default_large_upload() -> u64 {
     DEFAULT_LARGE_UPLOAD_BYTES
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSort {
+    #[default]
+    Name,
+    NameDescending,
+    Size,
+    SizeDescending,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFilter {
+    #[default]
+    All,
+    Files,
+    Folders,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutMode {
+    #[default]
+    Full,
+    Navigation,
+    Off,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundMode {
+    #[default]
+    Off,
+    Errors,
+    All,
+}
+
+/// Device-local desktop preferences; exported with the rest of the settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopOptions {
+    pub compact: bool,
+    pub text_size: u8,
+    pub sort: FileSort,
+    pub filter: FileFilter,
+    pub case_sensitive: bool,
+    pub folders_first: bool,
+    pub notify_success: bool,
+    pub notify_failure: bool,
+    pub notify_cancel: bool,
+    pub notification_seconds: u8,
+    pub notification_names: bool,
+    pub sound: SoundMode,
+    pub shortcuts: ShortcutMode,
+    pub context_menus: bool,
+    pub inline_help: bool,
+    pub shortcut_hints: bool,
+    pub first_run_help: bool,
+    pub tray_enabled: bool,
+    pub tray_when_idle: bool,
+    pub tray_badge: bool,
+    pub tray_open_transfers: bool,
+}
+impl Default for DesktopOptions {
+    fn default() -> Self {
+        Self {
+            compact: false,
+            text_size: 14,
+            sort: FileSort::Name,
+            filter: FileFilter::All,
+            case_sensitive: false,
+            folders_first: true,
+            notify_success: true,
+            notify_failure: true,
+            notify_cancel: false,
+            notification_seconds: 5,
+            notification_names: false,
+            sound: SoundMode::Off,
+            shortcuts: ShortcutMode::Full,
+            context_menus: true,
+            inline_help: true,
+            shortcut_hints: true,
+            first_run_help: true,
+            tray_enabled: false,
+            tray_when_idle: true,
+            tray_badge: true,
+            tray_open_transfers: true,
+        }
+    }
+}
+impl DesktopOptions {
+    pub fn validate(&self) -> Result<(), Error> {
+        if !(12..=20).contains(&self.text_size) || !(1..=30).contains(&self.notification_seconds) {
+            return Err(Error::InvalidDesktop);
+        }
+        Ok(())
+    }
+}
+
 /// Redundancy settings. `copies` = number of copies on distinct accounts:
 /// 1 is `single` (JBOD, no redundancy), N >= 2 is `mirror:N`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +168,11 @@ pub struct Config {
     /// many bytes in one go. 0 means always ask.
     #[serde(default = "default_large_upload")]
     large_upload_bytes: u64,
+    /// Disable application motion; never disable textual state feedback.
+    #[serde(default)]
+    reduced_motion: bool,
+    #[serde(default)]
+    desktop: DesktopOptions,
     #[serde(skip)]
     path: PathBuf,
     /// The file's text when it was last read or written (`None`: it did not
@@ -83,6 +188,8 @@ impl PartialEq for Config {
         self.default_copies == other.default_copies
             && self.folders == other.folders
             && self.large_upload_bytes == other.large_upload_bytes
+            && self.reduced_motion == other.reduced_motion
+            && self.desktop == other.desktop
     }
 }
 
@@ -94,6 +201,8 @@ impl Default for Config {
             default_copies: 1,
             folders: BTreeMap::new(),
             large_upload_bytes: DEFAULT_LARGE_UPLOAD_BYTES,
+            reduced_motion: false,
+            desktop: DesktopOptions::default(),
             path: PathBuf::new(),
             baseline: None,
         }
@@ -170,6 +279,7 @@ impl Config {
         if !valid(config.default_copies) || !config.folders.values().all(|&n| valid(n)) {
             return Err(Error::InvalidLevel(format!("in {}", path.display())));
         }
+        config.desktop.validate()?;
         config.path = path;
         config.baseline = baseline;
         Ok(config)
@@ -187,6 +297,7 @@ impl Config {
         if !valid(other.default_copies) || !other.folders.values().all(|&n| valid(n)) {
             return Err(Error::InvalidLevel("in the imported settings".to_owned()));
         }
+        other.desktop.validate()?;
         let mut folders = BTreeMap::new();
         for (folder, &copies) in &other.folders {
             folders.insert(normalize_folder(folder)?, copies);
@@ -195,12 +306,32 @@ impl Config {
             c.default_copies = other.default_copies;
             c.folders = folders;
             c.large_upload_bytes = other.large_upload_bytes;
+            c.reduced_motion = other.reduced_motion;
+            c.desktop = other.desktop.clone();
         })
     }
 
     #[must_use]
     pub fn large_upload_bytes(&self) -> u64 {
         self.large_upload_bytes
+    }
+
+    #[must_use]
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced_motion
+    }
+
+    pub fn set_reduced_motion(&mut self, reduced: bool) -> Result<(), Error> {
+        self.changing(|config| config.reduced_motion = reduced)
+    }
+
+    pub fn desktop(&self) -> &DesktopOptions {
+        &self.desktop
+    }
+
+    pub fn set_desktop(&mut self, options: DesktopOptions) -> Result<(), Error> {
+        options.validate()?;
+        self.changing(|config| config.desktop = options)
     }
 
     /// Sets the confirmation threshold and saves.
@@ -253,11 +384,19 @@ impl Config {
             self.default_copies,
             self.folders.clone(),
             self.large_upload_bytes,
+            self.reduced_motion,
+            self.desktop.clone(),
         );
         change(self);
         let result = self.save();
         if result.is_err() {
-            (self.default_copies, self.folders, self.large_upload_bytes) = before;
+            (
+                self.default_copies,
+                self.folders,
+                self.large_upload_bytes,
+                self.reduced_motion,
+                self.desktop,
+            ) = before;
         }
         result
     }
@@ -281,6 +420,65 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_preferences_round_trip_and_reject_invalid_values_without_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::load(&path).unwrap();
+        let options = DesktopOptions {
+            compact: true,
+            text_size: 18,
+            sort: FileSort::SizeDescending,
+            filter: FileFilter::Files,
+            notify_cancel: true,
+            sound: SoundMode::Errors,
+            shortcuts: ShortcutMode::Navigation,
+            tray_enabled: true,
+            tray_when_idle: false,
+            tray_badge: false,
+            tray_open_transfers: false,
+            ..DesktopOptions::default()
+        };
+        config.set_desktop(options.clone()).unwrap();
+        assert_eq!(Config::load(&path).unwrap().desktop(), &options);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let invalid = DesktopOptions {
+            text_size: 0,
+            ..options.clone()
+        };
+        assert!(config.set_desktop(invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(config.desktop(), &options);
+        let mut restored = Config::load(dir.path().join("restored.toml")).unwrap();
+        restored.restore_from(&config).unwrap();
+        assert_eq!(restored.desktop(), &options);
+        std::fs::write(&path, "default_copies=1\n").unwrap();
+        assert!(config.set_desktop(DesktopOptions::default()).is_err());
+        assert_eq!(config.desktop(), &options);
+    }
+
+    #[test]
+    fn legacy_settings_gain_motion_preference_without_changing_redundancy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_copies = 2\nlarge_upload_bytes = 42\n").unwrap();
+        let mut config = Config::load(&path).unwrap();
+        assert!(!config.reduced_motion());
+        config.set_reduced_motion(true).unwrap();
+        let saved = Config::load(&path).unwrap();
+        assert!(saved.reduced_motion());
+        assert_eq!(saved.default_copies(), 2);
+        assert_eq!(saved.large_upload_bytes(), 42);
+        // An external edit must not produce a false in-memory success.
+        std::fs::write(&path, "default_copies = 3\n").unwrap();
+        assert!(config.set_reduced_motion(false).is_err());
+        assert!(config.reduced_motion());
+        let mut restored = Config::load(dir.path().join("restored.toml")).unwrap();
+        restored.restore_from(&saved).unwrap();
+        assert!(restored.reduced_motion());
+        assert_eq!(restored.default_copies(), 2);
+    }
 
     #[test]
     fn parses_levels() {
