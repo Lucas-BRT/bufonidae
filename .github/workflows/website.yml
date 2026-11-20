@@ -4,7 +4,7 @@ name: Website
 # not push anything.
 on:
   push:
-    branches: [main]
+    branches: [develop, main]
     paths:
       - "website/**"
       - "vendor/**"
@@ -15,6 +15,7 @@ on:
       - "crates/bufonidae-cli/src/main.rs"
       - ".github/workflows/website.yml"
   pull_request:
+    branches: [develop, main]
     paths:
       - "website/**"
       - "vendor/**"

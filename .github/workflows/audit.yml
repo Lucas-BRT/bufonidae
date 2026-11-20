@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "10"
   CARGO_AUDIT_VERSION: "0.23.0"
   CARGO_DENY_VERSION: "0.20.2"
@@ -20,6 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: bufonidae
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: tool
         with:
@@ -36,6 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: bufonidae
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: tool
         with:
@@ -44,3 +51,49 @@ jobs:
       - if: steps.tool.outputs.cache-hit != 'true'
         run: cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
       - run: cargo deny --locked check
+
+  tool-versions:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Report newer releases for pinned tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          report=$(mktemp)
+          printf '%s\n\n' 'Newer stable releases are available for these pinned tools.' > "$report"
+          outdated=0
+          check_version() {
+            local tool=$1 pinned=$2 upstream=$3 tag latest
+            tag=$(gh api "repos/$upstream/releases/latest" --jq .tag_name)
+            latest=${tag##*/}
+            latest=${latest#v}
+            [[ $pinned =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            if [[ "$pinned" != "$latest" && "$(printf '%s\n' "$pinned" "$latest" | sort -V | tail -n 1)" == "$latest" ]]; then
+              printf -- '- %s: `%s` → `%s`\n' "$tool" "$pinned" "$latest" >> "$report"
+              outdated=1
+            fi
+          }
+          rust=$(sed -nE 's/^channel = "([^"]+)"$/\1/p' rust-toolchain.toml)
+          rclone=$(sed -nE 's/^[[:space:]]*RCLONE_VERSION: "([^"]+)"$/\1/p' .github/workflows/ci.yml)
+          check_version Rust "$rust" rust-lang/rust
+          check_version rclone "$rclone" rclone/rclone
+          check_version cargo-audit "$CARGO_AUDIT_VERSION" rustsec/rustsec
+          check_version cargo-deny "$CARGO_DENY_VERSION" EmbarkStudios/cargo-deny
+
+          if (( outdated == 0 )); then
+            echo 'Pinned tools are current.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          title='Pinned Rust tools with newer releases'
+          issue=$(gh issue list --state open --search "in:title $title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number")
+          if [[ -n "$issue" ]]; then
+            gh issue edit "$issue" --body-file "$report"
+          else
+            gh issue create --title "$title" --body-file "$report"
+          fi
