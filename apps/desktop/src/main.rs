@@ -21,6 +21,7 @@ mod theme;
 mod transfers;
 mod tray;
 mod tree;
+mod ui;
 
 use std::sync::Arc;
 

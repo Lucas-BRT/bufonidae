@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gpui::{
     AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, div, px,
+    Styled as _, Window, div,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _,
@@ -212,12 +212,7 @@ impl Render for AddAccountForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let submitting = matches!(self.phase, Phase::Submitting);
         let theme = cx.theme();
-        let (muted, danger, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.border,
-            theme.popover,
-        );
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
 
         let status = match &self.phase {
             Phase::Editing => None,
@@ -236,21 +231,11 @@ impl Render for AddAccountForm {
                     .text_sm()
                     .text_color(danger)
                     .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                    .child(div().flex_1().child(message.clone())),
+                    .child(div().flex_1().min_w(gpui::px(0.0)).child(message.clone())),
             ),
         };
 
-        div()
-            .v_flex()
-            .w(px(420.0))
-            .max_w(window.viewport_size().width - px(32.0))
-            .gap_4()
-            .p_6()
-            .rounded(px(14.0))
-            .bg(surface)
-            .border_1()
-            .border_color(border)
-            .shadow_lg()
+        crate::ui::Dialog::new(420.0, window, cx)
             .child(
                 div()
                     .v_flex()
@@ -282,7 +267,7 @@ impl Render for AddAccountForm {
                     .then(|| self.field(cx, "Name", &self.name, submitting)),
             )
             .children(status)
-            .child(
+            .footer(
                 div()
                     .h_flex()
                     .justify_end()

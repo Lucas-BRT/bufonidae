@@ -46,7 +46,8 @@ pub struct SettingsView {
     feedback_revision: usize,
     desktop_draft: config::DesktopOptions,
     desktop_status: Status,
-    notification_feedback: Option<String>,
+    notification_feedback: Option<(crate::ui::Tone, String)>,
+    scroll: gpui::ScrollHandle,
     notification_testing: bool,
 }
 
@@ -86,6 +87,7 @@ impl SettingsView {
             desktop_draft: config::DesktopOptions::default(),
             desktop_status: Status::Idle,
             notification_feedback: None,
+            scroll: gpui::ScrollHandle::new(),
             notification_testing: false,
         };
         view.load(window, cx);
@@ -319,15 +321,10 @@ impl Render for SettingsView {
                         .child(child)
                 }))
         };
-        let header = div()
-            .flex_none()
-            .px_6()
-            .pt_6()
-            .pb_4()
-            .child(div().text_2xl().font_semibold().child("Settings"));
+        let title = div().text_xl().font_semibold().child("Settings");
 
         if let Some(message) = &self.load_error {
-            return div().v_flex().size_full().child(header).child(
+            return div().v_flex().size_full().child(div().px_6().py_3().child(title)).child(
                 div().px_6().v_flex().gap_3()
                     .child(div().h_flex().items_start().gap_2().text_color(danger)
                         .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
@@ -337,12 +334,16 @@ impl Render for SettingsView {
             );
         }
         let Some(current) = self.config.clone() else {
-            return div().v_flex().size_full().child(header).child(
-                div()
-                    .px_6()
-                    .text_color(muted)
-                    .child(motion::activity("Loading settings", cx)),
-            );
+            return div()
+                .v_flex()
+                .size_full()
+                .child(div().px_6().py_3().child(title))
+                .child(
+                    div()
+                        .px_6()
+                        .text_color(muted)
+                        .child(motion::activity("Loading settings", cx)),
+                );
         };
 
         let saving = self.saving();
@@ -417,7 +418,8 @@ impl Render for SettingsView {
                                 this.change(RedundancyChange::RemoveRule(name.clone()), cx);
                             })),
                     )
-            });
+            })
+            .collect::<Vec<_>>();
 
         let rule_editor = div()
             .block()
@@ -429,81 +431,155 @@ impl Render for SettingsView {
             )
             .child(div().mb_2().child(rule_picker))
             .child(
-                button("add-rule")
-                    .label("Add rule")
-                    .disabled_feedback(saving)
-                    .on_click(cx.listener(|this, _, _, cx| this.add_rule(cx))),
+                div().h_flex().child(
+                    button("add-rule")
+                        .label("Add rule")
+                        .disabled_feedback(saving)
+                        .on_click(cx.listener(|this, _, _, cx| this.add_rule(cx))),
+                ),
             );
 
-        div().v_flex().size_full().child(header).child(
-            div()
-                .id("settings-body")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .px_6()
-                .pb_6()
-                .child(card(vec![
-                    div()
-                        .font_semibold()
-                        .child("Copies of each file")
-                        .into_any_element(),
-                    div()
-                        .text_color(muted)
-                        .child(
-                            "Each copy goes on a different account, so more copies survive \
+        // Jump links to the top-level sections of the scrolling page.
+        let mut jumps = div().h_flex().min_w(px(0.0)).flex_wrap().gap_1();
+        for (ix, label) in ["Copies", "Uploads", "Motion", "Desktop"]
+            .into_iter()
+            .enumerate()
+        {
+            jumps = jumps.child(
+                button(("settings-jump", ix))
+                    .ghost()
+                    .compact()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll.scroll_to_top_of_item(ix);
+                        cx.notify();
+                    })),
+            );
+        }
+        let header = div()
+            .h_flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap_x_4()
+            .gap_y_1()
+            .px_6()
+            .py_2()
+            .child(title.flex_none())
+            .child(jumps);
+        let save_bar = self.save_bar(cx);
+        div()
+            .v_flex()
+            .size_full()
+            .child(header)
+            .child(
+                div()
+                    .id("settings-body")
+                    .track_scroll(&self.scroll)
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .px_6()
+                    .pb_6()
+                    .child(card(vec![
+                        div()
+                            .font_semibold()
+                            .child("Copies of each file")
+                            .into_any_element(),
+                        div()
+                            .text_color(muted)
+                            .child(
+                                "Each copy goes on a different account, so more copies survive \
                          losing an account but use more space. This applies to files \
                          stored from now on; use Check to bring existing files up to it.",
-                        )
-                        .into_any_element(),
-                    default_picker.into_any_element(),
-                    div().text_sm().text_color(muted).child(if current.default_copies() == 1 { "Current default: 1 copy per file".to_owned() } else { format!("Current default: {} copies per file", current.default_copies()) }).into_any_element(),
-                    div().h_px().bg(border).into_any_element(),
-                    div()
-                        .font_medium()
-                        .child("Folders with their own rule")
-                        .into_any_element(),
-                    div()
-                        .block()
-                        .children(rules.map(|row| div().mb_2().child(row)))
-                        .into_any_element(),
-                    rule_editor.into_any_element(),
-                    div()
-                        .children(status_line(&self.redundancy_status, muted, danger, self.feedback_revision, cx))
-                        .into_any_element(),
-                ]))
-                .child(card(vec![
-                    div()
-                        .font_semibold()
-                        .child("Large uploads")
-                        .into_any_element(),
-                    div()
-                        .text_color(muted)
-                        .child(
-                            "Ask for confirmation before storing more than this in one go. \
+                            )
+                            .into_any_element(),
+                        default_picker.into_any_element(),
+                        div().h_px().bg(border).into_any_element(),
+                        div()
+                            .font_medium()
+                            .child("Folders with their own rule")
+                            .into_any_element(),
+                        div()
+                            .block()
+                            .children(rules.into_iter().map(|row| div().mb_2().child(row)))
+                            .into_any_element(),
+                        rule_editor.into_any_element(),
+                        div()
+                            .children(status_line(
+                                &self.redundancy_status,
+                                muted,
+                                danger,
+                                self.feedback_revision,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    ]))
+                    .child(card(vec![
+                        div()
+                            .font_semibold()
+                            .child("Large uploads")
+                            .into_any_element(),
+                        div()
+                            .text_color(muted)
+                            .child(
+                                "Ask for confirmation before storing more than this in one go. \
                          Dropping your whole home folder always asks. Set 0 to always ask.",
-                        )
-                        .into_any_element(),
-                    div().text_sm().text_color(muted).child("Enter a size in GB. Press Enter or leave the field to save.").into_any_element(),
-                    div()
-                        .w(px(200.0))
-                        .h_8()
-                        .child(Input::new(&self.limit).disabled(saving).suffix(div().text_color(muted).child("GB")))
-                        .into_any_element(),
-                    div()
-                        .children(status_line(&self.limit_status, muted, danger, self.feedback_revision, cx))
-                        .into_any_element(),
-                ]))
-                .child(card(vec![
-                    div().font_semibold().child("Motion and feedback").into_any_element(),
-                    checkbox("reduced-motion").label("Reduce motion")
-                        .checked(current.reduced_motion()).disabled_feedback(saving)
-                        .on_click(cx.listener(|this, reduced: &bool, _, cx| this.save_motion(*reduced, cx)))
-                        .into_any_element(),
-                    div().text_color(muted).child("Disable application fades, progress smoothing and pulsing activity indicators. Status text remains visible. This preference is saved on this device.").into_any_element(),
-                    div().children(status_line(&self.motion_status, muted, danger, self.feedback_revision, cx)).into_any_element(),
-                ]))
-                .child(self.desktop_panel(cx)),
-        )
+                            )
+                            .into_any_element(),
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Enter a size in GB. Press Enter or leave the field to save.")
+                            .into_any_element(),
+                        div()
+                            .w(px(200.0))
+                            .h_8()
+                            .child(
+                                Input::new(&self.limit)
+                                    .disabled(saving)
+                                    .suffix(div().text_color(muted).child("GB")),
+                            )
+                            .into_any_element(),
+                        div()
+                            .children(status_line(
+                                &self.limit_status,
+                                muted,
+                                danger,
+                                self.feedback_revision,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    ]))
+                    .child(card(vec![
+                        div()
+                            .font_semibold()
+                            .child("Motion and feedback")
+                            .into_any_element(),
+                        checkbox("reduced-motion")
+                            .label("Reduce motion")
+                            .checked(current.reduced_motion())
+                            .disabled_feedback(saving)
+                            .on_click(cx.listener(|this, reduced: &bool, _, cx| {
+                                this.save_motion(*reduced, cx)
+                            }))
+                            .into_any_element(),
+                        div()
+                            .text_color(muted)
+                            .child("Turn off fades, smooth progress and pulsing indicators.")
+                            .into_any_element(),
+                        div()
+                            .children(status_line(
+                                &self.motion_status,
+                                muted,
+                                danger,
+                                self.feedback_revision,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    ]))
+                    .child(self.desktop_panel(cx)),
+            )
+            .children(save_bar)
     }
 }

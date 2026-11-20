@@ -12,7 +12,7 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Selectable as _, StyledExt as _,
+    ActiveTheme as _, Icon, IconName, Selectable as _, StyledExt as _,
     button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
     progress::Progress as Bar,
@@ -396,12 +396,23 @@ impl Render for DistributionView {
                             ),
                         );
                 } else {
-                    row = row.child(div().text_sm().text_color(cx.theme().danger).child(
-                        match health.map(|h| &h.status) {
-                            Some(HealthStatus::Unreachable(why)) => format!("Unavailable: {why}"),
-                            _ => "Quota not reported. Sync requires known quotas.".into(),
-                        },
-                    ));
+                    row = row.child(
+                        div()
+                            .h_flex()
+                            .items_start()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
+                            .child(div().flex_1().min_w(px(0.0)).child(
+                                match health.map(|h| &h.status) {
+                                    Some(HealthStatus::Unreachable(why)) => {
+                                        format!("Unavailable: {why}")
+                                    }
+                                    _ => "Quota not reported. Sync requires known quotas.".into(),
+                                },
+                            )),
+                    );
                 }
                 if let Some(projected) = self
                     .preview
@@ -460,58 +471,102 @@ impl Render for DistributionView {
             ),
         ] {
             let selected = std::mem::discriminant(&self.mode) == std::mem::discriminant(&mode);
-            modes = modes.child(
-                button(id)
-                    .label(label)
-                    .selected(selected)
-                    .disabled_feedback(busy)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mode = mode.clone();
-                        if matches!(this.mode, Mode::Evacuate(_)) {
-                            this.mode = Mode::Evacuate(
-                                this.snapshot
-                                    .as_ref()
-                                    .and_then(|s| s.accounts.first())
-                                    .map(|a| a.id.clone())
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        this.invalidate();
-                        cx.notify();
-                    })),
-            );
+            let mode_button = button(id)
+                .label(label)
+                .selected(selected)
+                .disabled_feedback(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mode = mode.clone();
+                    if matches!(this.mode, Mode::Evacuate(_)) {
+                        this.mode = Mode::Evacuate(
+                            this.snapshot
+                                .as_ref()
+                                .and_then(|s| s.accounts.first())
+                                .map(|a| a.id.clone())
+                                .unwrap_or_default(),
+                        );
+                    }
+                    this.invalidate();
+                    cx.notify();
+                }));
+            modes = modes.child(if selected {
+                mode_button.primary()
+            } else {
+                mode_button
+            });
         }
-        body=body.child(modes).child(div().text_sm().text_color(muted).child("Balance equalizes percentage used, preserving unmanaged data and existing copy counts. Repair only adds missing policy copies. Mirror creates 2–8 distinct-account copies. Evacuate moves indexed copies off one account. Current policy and existing copy counts are never reduced. These are whole-file strategies; RAID 0 striping and RAID 5/6 parity are not supported. Future uploads retain the policy in Settings."));
+        let strategy_hint = match self.mode {
+            Mode::Balance => "Even out account usage while keeping existing copies.",
+            Mode::Repair => "Add missing copies to match your policy.",
+            Mode::Mirror(_) => "Keep 2–8 copies on separate accounts.",
+            Mode::Evacuate(_) => "Move indexed copies off the selected account.",
+        };
+        body = body
+            .child(modes)
+            .child(div().text_sm().text_color(muted).child(strategy_hint));
         if matches!(self.mode, Mode::Evacuate(_)) {
             let mut targets = div().h_flex().flex_wrap().gap_2();
             if let Some(snapshot) = &self.snapshot {
                 for (i, account) in snapshot.accounts.iter().enumerate() {
                     let id = account.id.clone();
-                    targets = targets.child(
-                        button(("evacuate-account", i))
-                            .label(format!("Evacuate {}", account.label))
-                            .selected(
-                                matches!(&self.mode,Mode::Evacuate(selected) if selected==&id),
-                            )
-                            .disabled_feedback(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode = Mode::Evacuate(id.clone());
-                                this.invalidate();
-                                cx.notify();
-                            })),
-                    );
+                    let chosen = matches!(&self.mode, Mode::Evacuate(selected) if selected == &id);
+                    let target_button = button(("evacuate-account", i))
+                        .label(format!("Evacuate {}", account.label))
+                        .selected(chosen)
+                        .disabled_feedback(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mode = Mode::Evacuate(id.clone());
+                            this.invalidate();
+                            cx.notify();
+                        }));
+                    targets = targets.child(if chosen {
+                        target_button.primary()
+                    } else {
+                        target_button
+                    });
                 }
             }
             body=body.child(targets).child(div().text_sm().child("Only indexed files move. Other remote data stays on the evacuated account; it remains connected."));
         }
-        let mut fields = div().h_flex().flex_wrap().gap_4();
+        let mut fields = div().h_flex().flex_wrap().items_end().gap_4();
         for i in 0..8 {
             if i != 6 || matches!(self.mode, Mode::Mirror(_)) {
                 fields = fields.child(self.field(i));
             }
         }
-        body=body.child(fields).child(div().text_sm().text_color(muted).child("Rates are editable assumptions and actual rclone caps, not measured internet speeds (Mbps = megabits/s). Transfers are sequential: source download → upload → destination readback; retiring a copy also re-downloads that original before deletion. Quota reset delay waits before transfer. The preview budget is a planning ceiling; retries/fallback reads may consume more. Provider bandwidth quota/reset is unknown. Stop external remote edits while Sync runs."))
-            .child(button("preview-sync").primary().label(if self.planning{"Planning…"}else{"Preview Sync"}).loading(self.planning&&motion::enabled(cx)).disabled_feedback(busy).on_click(cx.listener(|this,_,_,cx|this.preview(cx))));
+        body = body.child(fields).child(
+            div()
+                .v_flex()
+                .gap_1()
+                .text_sm()
+                .text_color(muted)
+                .child("Caps limit rclone speeds. The preview uses your quota delay and download budget.")
+                .child("Sync verifies replacement copies before removing originals.")
+                .child("Avoid changing remote files while Sync runs."),
+        );
+        if let Some(message) = &self.message {
+            body = body.child(
+                div()
+                    .text_color(if self.error {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().foreground
+                    })
+                    .child(bufonidae_rclone::escape_control(message)),
+            );
+        }
+        body = body.child(
+            button("preview-sync")
+                .primary()
+                .label(if self.planning {
+                    "Planning…"
+                } else {
+                    "Preview Sync"
+                })
+                .loading(self.planning && motion::enabled(cx))
+                .disabled_feedback(busy)
+                .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
+        );
         if self.planning {
             body = body.child(motion::activity("Preparing distribution preview", cx));
         }
@@ -531,7 +586,7 @@ impl Render for DistributionView {
                 .child(format!("{} file changes · {:.2} hours at configured caps, latency and quota delay",p.changes.len(),p.seconds()/3600.0))
                 .child(format!("Download {} = {} source + {} destination readback + {} original rechecks. Upload {}.",format::bytes(p.download_bytes),format::bytes(source_download),format::bytes(readback),format::bytes(recheck),format::bytes(p.upload_bytes)))
                 .child(format!("Peak local staging: {} + 64 MiB reserve · {} available in {}",format::bytes(p.temporary_bytes),format::bytes(preview.local_free),preview.staging.display()))
-                .child(div().text_sm().text_color(muted).child("Time = download bytes / download cap + upload bytes / upload cap + estimated operation setup latency + entered quota delay. Hashing, disk I/O, authentication, retries, provider throttling and unknown reset waits can extend it; this is not a guaranteed completion time."));
+                .child(div().text_sm().text_color(muted).child("Estimate uses transfer caps, setup time and quota delay. Retries and throttling can extend it."));
             let transfer_seconds = p.download_bytes as f64 / p.options.download_rate as f64
                 + p.upload_bytes as f64 / p.options.upload_rate as f64;
             body = body.child(div().text_sm().child(format!("50%-of-cap scenario: {:.2} hours. This is a speed scenario, not a measured confidence interval.",(p.seconds()+transfer_seconds)/3600.0)));
@@ -672,17 +727,6 @@ impl Render for DistributionView {
             }
             body=body.child(button("stop-sync").label("Stop after current file").disabled_feedback(stopping).on_click(cx.listener(|this,_,_,cx|{if let Some(cancel)=&this.cancel{cancel.store(true,Ordering::Relaxed);}cx.notify();})))
                 .child(div().text_sm().child("Stopping waits for the current file's copy/verify/commit sequence; a large file can take hours. Completed files remain saved. Keep this app open. Failures and interrupted runs are recorded in Transfers; use Check before a new preview."));
-        }
-        if let Some(message) = &self.message {
-            body = body.child(
-                div()
-                    .text_color(if self.error {
-                        cx.theme().danger
-                    } else {
-                        cx.theme().foreground
-                    })
-                    .child(bufonidae_rclone::escape_control(message)),
-            );
         }
         div()
             .id("storage-distribution")

@@ -1,10 +1,10 @@
 use crate::interaction::{ControlFeedback as _, button};
 use gpui::{
     AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Window, div, px,
+    ParentElement as _, Render, Styled as _, Window, div,
 };
 use gpui_component::{
-    ActiveTheme as _, Selectable as _, StyledExt as _,
+    Selectable as _, StyledExt as _,
     button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
 };
@@ -102,21 +102,13 @@ impl CommandsForm {
 }
 impl Render for CommandsForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut content = div()
-            .v_flex()
-            .gap_3()
-            .w(px(560.0))
-            .max_w(window.viewport_size().width - px(32.0))
-            .p_6()
-            .rounded(px(14.0))
-            .bg(cx.theme().popover)
-            .border_1()
-            .border_color(cx.theme().border)
-            .child(div().text_xl().font_semibold().child(if self.help {
+        let mut content = crate::ui::Dialog::new(560.0, window, cx).child(
+            div().text_xl().font_semibold().child(if self.help {
                 "Bufonidae help"
             } else {
                 "Commands"
-            }));
+            }),
+        );
         if self.help && self.guide_step.is_some() {
             let steps = [
                 (
@@ -252,11 +244,15 @@ impl Render for CommandsForm {
                 );
             }
         }
-        content
+        div()
             .child(
-                button("close-commands")
-                    .label("Close")
-                    .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
+                content.footer(
+                    div().h_flex().justify_end().child(
+                        button("close-commands")
+                            .label("Close")
+                            .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
+                    ),
+                ),
             )
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if !this.help && matches!(event.keystroke.key.as_str(), "up" | "down") {

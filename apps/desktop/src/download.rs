@@ -194,38 +194,21 @@ impl DownloadForm {
     fn line(icon: IconName, text: String, color: gpui::Hsla) -> impl IntoElement {
         div()
             .h_flex()
+            .w_full()
             .items_start()
             .gap_2()
             .text_sm()
             .text_color(color)
             .child(Icon::new(icon).size_4().flex_none())
-            .child(div().flex_1().child(text))
+            .child(div().flex_1().min_w(px(0.0)).child(text))
     }
 }
 
 impl Render for DownloadForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, success, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.success,
-            theme.border,
-            theme.popover,
-        );
-        let card = || {
-            div()
-                .v_flex()
-                .w(px(480.0))
-                .max_w(window.viewport_size().width - px(32.0))
-                .gap_4()
-                .p_6()
-                .rounded(px(14.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .shadow_lg()
-        };
+        let (muted, danger, success) = (theme.muted_foreground, theme.danger, theme.success);
+        let card = || crate::ui::Dialog::new(480.0, window, cx);
         let title = |text: &str| div().text_xl().font_semibold().child(text.to_owned());
         let close = |cx: &mut Context<Self>| {
             div().h_flex().justify_end().child(
@@ -269,8 +252,8 @@ impl Render for DownloadForm {
                             .text_color(muted)
                             .child(format!("Saving to {}", self.out.display())),
                     )
-                    .child(
-                        div().h_flex().justify_end().child(
+                    .footer(
+ div().h_flex().justify_end().child(
                             button("stop")
                                 .label(if c.cancelling { "Stopping…" } else { "Cancel" })
                                 .disabled_feedback(c.cancelling)
@@ -298,7 +281,7 @@ impl Render for DownloadForm {
                     ),
                     muted,
                 ))
-                .child(close(cx))
+                .footer(close(cx))
                 .into_any_element(),
 
             Phase::Failed(message) => card()
@@ -308,7 +291,7 @@ impl Render for DownloadForm {
                     message.clone(),
                     danger,
                 ))
-                .child(close(cx))
+                .footer(close(cx))
                 .into_any_element(),
 
             Phase::Finished(report) => {
@@ -354,7 +337,7 @@ impl Render for DownloadForm {
                 card()
                     .child(title(if complete { "Done" } else { "Downloaded with problems" }))
                     .child(div().v_flex().gap_2().children(lines))
-                    .child(close(cx))
+                    .footer(close(cx))
                     .into_any_element()
             }
         };
