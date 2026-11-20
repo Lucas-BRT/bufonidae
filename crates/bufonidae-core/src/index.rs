@@ -100,6 +100,8 @@ pub struct Job {
     pub payload: String,
     pub state: String,
     pub error: Option<String>,
+    /// When the job was queued, in seconds since the Unix epoch.
+    pub created_at: i64,
 }
 
 pub struct Index {
@@ -630,7 +632,7 @@ impl Index {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, operation, payload, state, error FROM jobs ORDER BY created_at, rowid",
+                "SELECT id, operation, payload, state, error, created_at FROM jobs ORDER BY created_at, rowid",
                 (),
             )
             .await?;
@@ -642,6 +644,7 @@ impl Index {
                 payload: row.get(2)?,
                 state: row.get(3)?,
                 error: row.get(4)?,
+                created_at: row.get(5)?,
             });
         }
         Ok(jobs)
