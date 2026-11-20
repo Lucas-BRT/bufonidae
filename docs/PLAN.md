@@ -146,18 +146,19 @@ Honest list, most important first. Nothing here is hidden by the status above.
 
 ## 7. Best practices
 
-- Pinned `rust-toolchain.toml` (1.99.1 today), `rustfmt.toml`, `[workspace.lints]` (`unsafe_code = "forbid"` in core, selective clippy `pedantic`).
+- Pinned `rust-toolchain.toml` (1.99.1 today), `rustfmt.toml`, `[workspace.lints]` (forbid unsafe code, warn on unwrap, and run `cargo pedantic` for additional diagnostics).
 - Inherited `[workspace.package]` (edition, license, rust-version).
 - Typed errors in libraries; `anyhow` only at the edge. No `unwrap` outside tests.
 - Synchronous core where possible; async only at the I/O boundary. Traits (`RemoteFs`, `Placement`, `Clock`) for deterministic tests.
 - Profiles: `dev debug=0`, dev deps `debug=false`; `release strip=true, lto="thin", codegen-units=16`; size-tuned `[profile.website]`.
+- Tracked `.githooks/` validate commit subjects and run workspace checks before pushing.
 - Commits drafted with `pionus` and reviewed against the diff; dependency/toolchain bumps in separate commits with the reason.
 - No secrets in logs; redact passwords/tokens in `Debug`.
 - `SECURITY.md`; ToS notice in the README.
 
 ## 8. CI/CD
 
-`.github/workflows/ci.yml`:
+`.github/workflows/ci.yml` runs on pushes and PRs targeting `develop` or `main`:
 - `concurrency: ci-${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true`
 - `permissions: contents: read`; `env: CARGO_TERM_COLOR=always, CARGO_INCREMENTAL=0, CARGO_NET_RETRY=10`
 - `Swatinem/rust-cache@v2` pinned by SHA, same `shared-key` in every job
@@ -174,7 +175,7 @@ Other workflows:
 
 ## 9. Repository
 
-Private `Lucas-BRT/bufonidae` on GitHub, default branch `main`, MIT `LICENSE`, README and `AGENTS.md` (including the English-only rule).
+Private `Lucas-BRT/bufonidae` on GitHub, default branch `main`, PRs from feature/fix branches to `develop` and from `develop` to `main`, MIT `LICENSE`, README and `AGENTS.md` (including the English-only rule).
 
 ## 10. Decided
 
