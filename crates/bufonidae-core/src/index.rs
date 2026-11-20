@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use turso::{Builder, Connection, params};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -89,6 +89,19 @@ pub struct PendingPlacement {
 pub struct LostFile {
     pub path: String,
     pub size: u64,
+}
+
+/// A persisted transfer request. Payload contains paths and operation options,
+/// never credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub id: String,
+    pub operation: String,
+    pub payload: String,
+    pub state: String,
+    pub error: Option<String>,
+    /// When the job was queued, in seconds since the Unix epoch.
+    pub created_at: i64,
 }
 
 pub struct Index {
@@ -204,6 +217,19 @@ impl Index {
                      );",
                 )
                 .await?;
+        }
+        if version < 4 {
+            self.conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS jobs (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     operation TEXT NOT NULL,
+                     payload TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'interrupted', 'done', 'failed', 'cancelled')),
+                     error TEXT,
+                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );",
+            ).await?;
         }
         if version < SCHEMA_VERSION {
             // Every step above is `IF NOT EXISTS`, so a crash before this line
@@ -563,11 +589,135 @@ impl Index {
         }
         Ok(out)
     }
+
+    /// Adds a job before any remote side effect begins.
+    pub async fn enqueue_job(&self, operation: &str, payload: &str) -> Result<String, Error> {
+        let _turn = self.gate.lock().await;
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO jobs (id, operation, payload, state) VALUES (?1, ?2, ?3, 'queued')",
+                params![id.as_str(), operation, payload],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    /// Changes a job state and records an optional failure reason.
+    pub async fn set_job_state(
+        &self,
+        id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<(), Error> {
+        if !matches!(
+            state,
+            "queued" | "running" | "interrupted" | "done" | "failed" | "cancelled"
+        ) {
+            return Err(Error::Corrupt(format!("unknown job state {state:?}")));
+        }
+        let _turn = self.gate.lock().await;
+        self.conn
+            .execute(
+                "UPDATE jobs SET state = ?2, error = ?3, updated_at = unixepoch() WHERE id = ?1",
+                params![id, state, error],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Lists persisted jobs, oldest first.
+    pub async fn jobs(&self) -> Result<Vec<Job>, Error> {
+        let _turn = self.gate.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, operation, payload, state, error, created_at FROM jobs ORDER BY created_at, rowid",
+                (),
+            )
+            .await?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            jobs.push(Job {
+                id: row.get(0)?,
+                operation: row.get(1)?,
+                payload: row.get(2)?,
+                state: row.get(3)?,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+        Ok(jobs)
+    }
+
+    /// Marks jobs left active by a previous process as interrupted.
+    pub async fn interrupt_active_jobs(&self) -> Result<(), Error> {
+        let _turn = self.gate.lock().await;
+        self.conn.execute("UPDATE jobs SET state = 'interrupted', updated_at = unixepoch() WHERE state IN ('queued', 'running')", ()).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transfer_jobs_survive_restart_and_only_active_jobs_are_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let (running, waiting, completed);
+        {
+            let index = Index::open(&path).await.unwrap();
+            running = index
+                .enqueue_job(
+                    "upload",
+                    r#"{"paths":["/tmp/source"],"destination":"Docs"}"#,
+                )
+                .await
+                .unwrap();
+            waiting = index
+                .enqueue_job("download", r#"["Docs/file","/tmp/out"]"#)
+                .await
+                .unwrap();
+            completed = index.enqueue_job("download", "{}").await.unwrap();
+            index
+                .set_job_state(&running, "running", None)
+                .await
+                .unwrap();
+            index.set_job_state(&completed, "done", None).await.unwrap();
+        }
+        let index = Index::open(&path).await.unwrap();
+        index.interrupt_active_jobs().await.unwrap();
+        let jobs = index.jobs().await.unwrap();
+        assert_eq!(jobs.len(), 3);
+        for id in [running, waiting] {
+            assert_eq!(
+                jobs.iter().find(|job| job.id == id).unwrap().state,
+                "interrupted"
+            );
+        }
+        assert_eq!(
+            jobs.iter().find(|job| job.id == completed).unwrap().state,
+            "done"
+        );
+        index.interrupt_active_jobs().await.unwrap();
+        assert_eq!(index.jobs().await.unwrap(), jobs);
+    }
+
+    #[tokio::test]
+    async fn transfer_errors_survive_and_invalid_states_are_refused() {
+        let index = Index::open_memory().await.unwrap();
+        let id = index.enqueue_job("upload", "{}").await.unwrap();
+        index
+            .set_job_state(&id, "failed", Some("network unavailable"))
+            .await
+            .unwrap();
+        assert!(index.set_job_state(&id, "invented", None).await.is_err());
+        let jobs = index.jobs().await.unwrap();
+        assert_eq!(jobs[0].state, "failed");
+        assert_eq!(jobs[0].error.as_deref(), Some("network unavailable"));
+    }
 
     #[tokio::test]
     async fn pending_then_done_lifecycle() {

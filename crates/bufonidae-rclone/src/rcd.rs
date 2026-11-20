@@ -32,6 +32,13 @@ pub struct About {
     pub other: Option<u64>,
 }
 
+/// Measured network/transfer counters, including retried bytes.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct TransferStats {
+    pub bytes: u64,
+    pub speed: f64,
+}
+
 /// One entry of `operations/list`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -175,6 +182,15 @@ impl Rcd {
         self.call("operations/about", &json!({ "fs": fs })).await
     }
 
+    pub async fn transfer_stats(&self) -> Result<TransferStats, Error> {
+        self.call("core/stats", &json!({ "short": true })).await
+    }
+
+    pub async fn reset_transfer_stats(&self) -> Result<(), Error> {
+        let _: serde_json::Value = self.call("core/stats-reset", &json!({})).await?;
+        Ok(())
+    }
+
     /// `operations/list`: entries of `remote` (a path inside `fs`).
     pub async fn list(&self, fs: &str, remote: &str) -> Result<Vec<Entry>, Error> {
         let response: ListResponse = self
@@ -258,6 +274,14 @@ impl Rcd {
     /// Stops the daemon and waits for it to exit.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         self.child.kill().await.map_err(Error::Spawn)
+    }
+
+    /// Checks whether the supervised process has exited, reaping it if so.
+    pub fn is_running(&mut self) -> Result<bool, Error> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_none())
+            .map_err(Error::Spawn)
     }
 }
 

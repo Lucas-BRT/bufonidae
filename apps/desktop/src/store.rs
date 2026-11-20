@@ -1,6 +1,8 @@
 //! The "Store files" modal: what is about to be stored, where, how many
 //! copies, live progress and an honest result.
 
+use crate::interaction::{ControlFeedback as _, button, checkbox};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,15 +13,14 @@ use gpui::{
     Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    checkbox::Checkbox,
+    ActiveTheme as _, Icon, IconName, StyledExt as _,
+    button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
-    progress::Progress,
 };
 
+use crate::backend::TransferEvent;
 use crate::backend::{Backend, Inspection, StoreJob, StoreOutcome};
-use crate::format;
+use crate::{format, motion};
 
 /// How many problem lines the result lists before summarising the rest.
 const MAX_LISTED: usize = 5;
@@ -39,6 +40,12 @@ struct Counters {
     current: String,
     /// The user asked to stop; waiting for the job to wind down.
     cancelling: bool,
+    stage: &'static str,
+    progress_from: f32,
+    progress_to: f32,
+    progress_revision: usize,
+    progress_started: Option<std::time::Instant>,
+    live: Option<bufonidae_rclone::rcd::TransferStats>,
 }
 
 enum Phase {
@@ -119,6 +126,16 @@ impl StoreForm {
         }
     }
 
+    pub(crate) fn set_destination(
+        &mut self,
+        destination: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dest
+            .update(cx, |field, cx| field.set_value(destination, window, cx));
+    }
+
     /// Copies wanted for the folder currently typed, and whether the accounts
     /// can provide them.
     fn plan(&self, cx: &Context<Self>) -> Option<(u8, bool)> {
@@ -189,9 +206,50 @@ impl StoreForm {
         cx.spawn(async move |this, cx| {
             let mut started = false;
             while let Some(event) = events.recv().await {
-                started = true;
+                started |= matches!(event, TransferEvent::Progress(_));
                 this.update(cx, |this, cx| {
                     if let Phase::Running(c) = &mut this.phase {
+                        let event = match event {
+                            TransferEvent::Stage(label) => {
+                                c.stage = label;
+                                cx.notify();
+                                return;
+                            }
+                            TransferEvent::Live(sample) => {
+                                c.live = sample;
+                                if let Some(sample) = sample {
+                                    c.progress_from =
+                                        c.progress_started.map_or(c.progress_to, |started| {
+                                            motion::progress_sample(
+                                                c.progress_from,
+                                                c.progress_to,
+                                                started.elapsed(),
+                                            )
+                                        });
+                                    c.progress_to = c.progress_to.max(
+                                        motion::completion_percent(
+                                            sample.bytes,
+                                            c.bytes_total,
+                                            0,
+                                            0,
+                                        )
+                                        .min(99.0),
+                                    );
+                                    c.progress_revision += 1;
+                                    c.progress_started = Some(std::time::Instant::now());
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            TransferEvent::Progress(event) => event,
+                        };
+                        c.progress_from = c.progress_started.map_or(c.progress_to, |started| {
+                            motion::progress_sample(
+                                c.progress_from,
+                                c.progress_to,
+                                started.elapsed(),
+                            )
+                        });
                         match event {
                             PutProgress::Planned { copies, bytes } => {
                                 c.copies_total = copies;
@@ -207,6 +265,17 @@ impl StoreForm {
                                 c.current = rel;
                             }
                         }
+                        c.progress_to = c.progress_to.max(
+                            motion::completion_percent(
+                                c.bytes_done,
+                                c.bytes_total,
+                                c.copies_done,
+                                c.copies_total,
+                            )
+                            .min(99.0),
+                        );
+                        c.progress_revision += 1;
+                        c.progress_started = Some(std::time::Instant::now());
                     }
                     cx.notify();
                 })
@@ -243,12 +312,13 @@ impl StoreForm {
     fn message_line(icon: IconName, text: String, color: gpui::Hsla) -> impl IntoElement {
         div()
             .h_flex()
+            .w_full()
             .items_start()
             .gap_2()
             .text_sm()
             .text_color(color)
             .child(Icon::new(icon).size_4().flex_none())
-            .child(div().flex_1().child(text))
+            .child(div().flex_1().min_w(px(0.0)).child(text))
     }
 
     fn summary_of_paths(&self) -> String {
@@ -272,30 +342,13 @@ impl StoreForm {
 
 impl Render for StoreForm {
     #[allow(clippy::too_many_lines)]
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, success, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.success,
-            theme.border,
-            theme.popover,
-        );
-        let card = || {
-            div()
-                .v_flex()
-                .w(px(480.0))
-                .gap_4()
-                .p_6()
-                .rounded(px(14.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .shadow_lg()
-        };
+        let (muted, danger, success) = (theme.muted_foreground, theme.danger, theme.success);
+        let card = || crate::ui::Dialog::new(480.0, window, cx);
         let title = |text: &str| div().text_xl().font_semibold().child(text.to_owned());
 
-        match &self.phase {
+        let content = match &self.phase {
             Phase::Inspecting => card()
                 .child(title("Store files"))
                 .child(
@@ -312,9 +365,9 @@ impl Render for StoreForm {
                     message.clone(),
                     danger,
                 ))
-                .child(
-                    div().h_flex().justify_end().child(
-                        Button::new("close")
+                .footer(
+ div().h_flex().justify_end().child(
+                        button("close")
                             .primary()
                             .label("Close")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -326,54 +379,63 @@ impl Render for StoreForm {
                 )
                 .into_any_element(),
 
-            Phase::Running(c) => {
-                #[allow(clippy::cast_precision_loss)]
-                let percent = if c.bytes_total > 0 {
-                    (c.bytes_done as f32 / c.bytes_total as f32 * 100.0).min(100.0)
-                } else if c.copies_total > 0 {
-                    c.copies_done as f32 / c.copies_total as f32 * 100.0
+            Phase::Running(c) => card()
+                .child(title(if c.cancelling {
+                    "Stopping…"
                 } else {
-                    0.0
-                };
-                card()
-                    .child(title(if c.cancelling {
-                        "Stopping…"
+                    "Storing files"
+                }))
+                .child(motion::activity(
+                    if c.cancelling {
+                        "Cancelling — waiting for the transfer to stop"
+                    } else if c.stage.is_empty() {
+                        "Preparing transfer"
                     } else {
-                        "Storing files"
-                    }))
-                    .child(Progress::new().value(percent))
-                    .child(div().text_color(muted).child(format!(
-                        "{} of {} copies · {} of {}",
-                        c.copies_done,
-                        c.copies_total,
-                        format::bytes(c.bytes_done),
-                        format::bytes(c.bytes_total),
-                    )))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(c.current.clone()),
-                    )
-                    .child(div().text_sm().text_color(muted).child(
-                        "Cancel stops the transfer in progress. Copies already stored stay \
+                        c.stage
+                    },
+                    cx,
+                ))
+                .children((c.copies_total > 0).then(|| {
+                    motion::progress(c.progress_from, c.progress_to, c.progress_revision, cx)
+                }))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(if c.live.is_some() { "Live transferred bytes include retries. Completion follows file verification." } else { "Waiting for live transfer statistics; completed files are still counted." }),
+                )
+                .children(c.live.map(|sample| div().text_sm().text_color(muted).child(format!("{} transferred · {}/s", format::bytes(sample.bytes), format::bytes(sample.speed.max(0.0) as u64)))))
+                .child(div().text_color(muted).child(format!(
+                    "{} of {} copies · {} of {}",
+                    c.copies_done,
+                    c.copies_total,
+                    format::bytes(c.bytes_done),
+                    format::bytes(c.bytes_total),
+                )))
+                .child(div().truncate().text_sm().text_color(muted).child(
+                    if c.current.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Last processed: {}", c.current)
+                    },
+                ))
+                .child(div().text_sm().text_color(muted).child(
+                    "Cancel stops the transfer in progress. Copies already stored stay \
                          stored.",
-                    ))
-                    .child(
-                        div().h_flex().justify_end().child(
-                            Button::new("stop")
-                                .label(if c.cancelling {
-                                    "Stopping…"
-                                } else {
-                                    "Cancel"
-                                })
-                                .disabled(c.cancelling)
-                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                        ),
-                    )
-                    .into_any_element()
-            }
+                ))
+                .footer(
+ div().h_flex().justify_end().child(
+                        button("stop")
+                            .label(if c.cancelling {
+                                "Stopping…"
+                            } else {
+                                "Cancel"
+                            })
+                            .disabled_feedback(c.cancelling)
+                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                    ),
+                )
+                .into_any_element(),
 
             Phase::Cancelled(c) => card()
                 .child(title("Cancelled"))
@@ -397,9 +459,9 @@ impl Render for StoreForm {
                             muted,
                         )),
                 )
-                .child(
-                    div().h_flex().justify_end().child(
-                        Button::new("done")
+                .footer(
+ div().h_flex().justify_end().child(
+                        button("done")
                             .primary()
                             .label("Done")
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
@@ -485,9 +547,9 @@ impl Render for StoreForm {
                         "Stored with problems"
                     }))
                     .child(div().v_flex().gap_2().children(lines))
-                    .child(
-                        div().h_flex().justify_end().child(
-                            Button::new("done")
+                    .footer(
+ div().h_flex().justify_end().child(
+                            button("done")
                                 .primary()
                                 .label("Done")
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
@@ -566,7 +628,7 @@ impl Render for StoreForm {
                             .gap_2()
                             .child(Self::message_line(IconName::TriangleAlert, text, danger))
                             .child(
-                                Checkbox::new("confirm-large")
+                                checkbox("confirm-large")
                                     .label("I understand, store it anyway")
                                     .checked(self.confirmed)
                                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -629,28 +691,39 @@ impl Render for StoreForm {
                         config::describe(copies),
                     )))
                     .children(notes)
-                    .child(
-                        div()
-                            .h_flex()
-                            .justify_end()
+                    .footer(
+ div().h_flex().justify_end()
                             .gap_2()
                             .child(
-                                Button::new("cancel")
+                                button("cancel")
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                             )
-                            .child(
-                                Button::new("store")
-                                    .primary()
+                            .child({
+                                let store = button("store")
                                     .label("Store")
-                                    .disabled(!can_start)
+                                    .disabled_feedback(!can_start)
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.start(window, cx)),
-                                    ),
-                            ),
+                                    );
+                                // Past the size limit, the action itself carries the warning.
+                                if self.needs_confirmation() {
+                                    store.danger()
+                                } else {
+                                    store.primary()
+                                }
+                            }),
                     )
                     .into_any_element()
             }
+        };
+        if matches!(
+            self.phase,
+            Phase::Finished(_) | Phase::Cancelled(_) | Phase::Failed(_)
+        ) {
+            motion::fade(content, "upload-result", false, 1.0, cx)
+        } else {
+            content
         }
     }
 }

@@ -136,7 +136,12 @@ impl RemoteFs for Rcd {
             .about(&format!("{}:", account.remote_name()))
             .await
             .map_err(|e| Error::Remote(e.to_string()))?;
-        Ok(about.free)
+        Ok(about.free.or_else(|| {
+            about
+                .total
+                .zip(about.used)
+                .map(|(total, used)| total.saturating_sub(used))
+        }))
     }
 
     async fn list_files(&self, account: &Account, dir: &str) -> Result<Listing, Error> {

@@ -1,17 +1,17 @@
 //! The "Remove account" confirmation: says what removing does and does not do.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use std::sync::Arc;
 
 use gpui::{
     Context, EventEmitter, IntoElement, ParentElement as _, Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
 use crate::backend::Backend;
-use crate::format;
 
 pub enum RemoveEvent {
     Cancelled,
@@ -86,59 +86,49 @@ impl RemoveForm {
 }
 
 impl Render for RemoveForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.border,
-            theme.popover,
-        );
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
         let removing = matches!(self.phase, Phase::Removing);
         let line = |icon: IconName, text: String, color: gpui::Hsla| {
             div()
                 .h_flex()
+                .w_full()
                 .items_start()
                 .gap_2()
                 .text_color(color)
                 .child(Icon::new(icon).size_4().flex_none())
-                .child(div().flex_1().child(text))
+                .child(div().flex_1().min_w(px(0.0)).child(text))
         };
 
         let mut body = div().v_flex().gap_2().child(line(
             IconName::Info,
-            "Its password is forgotten and the app stops using it. Nothing is deleted from \
-             the Mega account."
+            "Disconnects this account and forgets its password. Mega files stay in place."
                 .to_owned(),
             muted,
         ));
-        if self.files > 0 {
+        if self.only_here > 0 {
             body = body.child(line(
                 IconName::TriangleAlert,
                 format!(
-                    "{} have a copy here, and {} of them have no copy anywhere else, so they \
-                     stop being available in Bufonidae. To get them back, connect this \
-                     account again and check your files.",
-                    format::files(self.files),
-                    self.only_here
+                    "Files with no other copy ({}) become unavailable in Bufonidae. \
+                     Reconnect this account and run Check to regain access.",
+                    self.only_here,
                 ),
                 danger,
+            ));
+        } else if self.files > 0 {
+            body = body.child(line(
+                IconName::Info,
+                "All files on this account have another copy in Bufonidae.".to_owned(),
+                muted,
             ));
         }
         if let Phase::Failed(message) = &self.phase {
             body = body.child(line(IconName::CircleX, message.clone(), danger));
         }
 
-        div()
-            .v_flex()
-            .w(px(460.0))
-            .gap_4()
-            .p_6()
-            .rounded(px(14.0))
-            .bg(surface)
-            .border_1()
-            .border_color(border)
-            .shadow_lg()
+        crate::ui::Dialog::new(560.0, window, cx)
             .child(
                 div()
                     .v_flex()
@@ -154,20 +144,23 @@ impl Render for RemoveForm {
             .child(body)
             .child(
                 div()
+                    .flex_none()
+                    .flex_wrap()
                     .h_flex()
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("keep")
+                        button("keep")
                             .label("Keep it")
-                            .disabled(removing)
+                            .disabled_feedback(removing)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("remove")
+                        button("remove")
                             .danger()
                             .label("Remove account")
-                            .loading(removing)
+                            .loading(removing && crate::motion::enabled(cx))
+                            .disabled_feedback(removing)
                             .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
                     ),
             )

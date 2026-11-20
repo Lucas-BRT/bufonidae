@@ -1,6 +1,8 @@
 //! The "Download" modal: runs a download with live progress, can be cancelled
 //! and ends with an honest result.
 
+use crate::interaction::{ControlFeedback as _, button};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,13 +11,12 @@ use gpui::{
     Context, EventEmitter, IntoElement, ParentElement as _, Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    progress::Progress,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
+use crate::backend::TransferEvent;
 use crate::backend::{Backend, DownloadJob, DownloadOutcome};
-use crate::format;
+use crate::{format, motion};
 
 const MAX_LISTED: usize = 5;
 
@@ -31,6 +32,12 @@ struct Counters {
     bytes_done: u64,
     current: String,
     cancelling: bool,
+    stage: &'static str,
+    progress_from: f32,
+    progress_to: f32,
+    progress_revision: usize,
+    progress_started: Option<std::time::Instant>,
+    live: Option<bufonidae_rclone::rcd::TransferStats>,
 }
 
 enum Phase {
@@ -49,17 +56,63 @@ pub struct DownloadForm {
 impl EventEmitter<DownloadEvent> for DownloadForm {}
 
 impl DownloadForm {
-    pub fn new(backend: &Arc<Backend>, path: String, out: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new_selection(
+        backend: &Arc<Backend>,
+        paths: Vec<String>,
+        out: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let DownloadJob {
             mut events,
             cancel,
             result,
-        } = backend.download(path, out.clone());
+        } = backend.download_selection(paths, out.clone());
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 this.update(cx, |this, cx| {
                     if let Phase::Running(c) = &mut this.phase {
+                        let event = match event {
+                            TransferEvent::Stage(label) => {
+                                c.stage = label;
+                                cx.notify();
+                                return;
+                            }
+                            TransferEvent::Live(sample) => {
+                                c.live = sample;
+                                if let Some(sample) = sample {
+                                    c.progress_from =
+                                        c.progress_started.map_or(c.progress_to, |started| {
+                                            motion::progress_sample(
+                                                c.progress_from,
+                                                c.progress_to,
+                                                started.elapsed(),
+                                            )
+                                        });
+                                    c.progress_to = c.progress_to.max(
+                                        motion::completion_percent(
+                                            sample.bytes,
+                                            c.bytes_total,
+                                            0,
+                                            0,
+                                        )
+                                        .min(99.0),
+                                    );
+                                    c.progress_revision += 1;
+                                    c.progress_started = Some(std::time::Instant::now());
+                                }
+                                cx.notify();
+                                return;
+                            }
+                            TransferEvent::Progress(event) => event,
+                        };
+                        c.progress_from = c.progress_started.map_or(c.progress_to, |started| {
+                            motion::progress_sample(
+                                c.progress_from,
+                                c.progress_to,
+                                started.elapsed(),
+                            )
+                        });
                         match event {
                             GetProgress::Planned { files, bytes } => {
                                 c.files_total = files;
@@ -75,6 +128,17 @@ impl DownloadForm {
                                 c.current = path;
                             }
                         }
+                        c.progress_to = c.progress_to.max(
+                            motion::completion_percent(
+                                c.bytes_done,
+                                c.bytes_total,
+                                c.files_done,
+                                c.files_total,
+                            )
+                            .min(99.0),
+                        );
+                        c.progress_revision += 1;
+                        c.progress_started = Some(std::time::Instant::now());
                     }
                     cx.notify();
                 })
@@ -130,65 +194,44 @@ impl DownloadForm {
     fn line(icon: IconName, text: String, color: gpui::Hsla) -> impl IntoElement {
         div()
             .h_flex()
+            .w_full()
             .items_start()
             .gap_2()
             .text_sm()
             .text_color(color)
             .child(Icon::new(icon).size_4().flex_none())
-            .child(div().flex_1().child(text))
+            .child(div().flex_1().min_w(px(0.0)).child(text))
     }
 }
 
 impl Render for DownloadForm {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, success, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.success,
-            theme.border,
-            theme.popover,
-        );
-        let card = || {
-            div()
-                .v_flex()
-                .w(px(480.0))
-                .gap_4()
-                .p_6()
-                .rounded(px(14.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .shadow_lg()
-        };
+        let (muted, danger, success) = (theme.muted_foreground, theme.danger, theme.success);
+        let card = || crate::ui::Dialog::new(480.0, window, cx);
         let title = |text: &str| div().text_xl().font_semibold().child(text.to_owned());
         let close = |cx: &mut Context<Self>| {
             div().h_flex().justify_end().child(
-                Button::new("close")
+                button("close")
                     .primary()
                     .label("Done")
                     .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
             )
         };
 
-        match &self.phase {
+        let content = match &self.phase {
             Phase::Running(c) => {
-                #[allow(clippy::cast_precision_loss)]
-                let percent = if c.bytes_total > 0 {
-                    (c.bytes_done as f32 / c.bytes_total as f32 * 100.0).min(100.0)
-                } else if c.files_total > 0 {
-                    c.files_done as f32 / c.files_total as f32 * 100.0
-                } else {
-                    0.0
-                };
                 card()
                     .child(title(if c.cancelling {
                         "Stopping…"
                     } else {
                         "Downloading"
                     }))
-                    .child(Progress::new().value(percent))
-                    .child(div().text_color(muted).child(format!(
+                    .child(motion::activity(if c.cancelling { "Cancelling — waiting for the transfer to stop" } else if c.stage.is_empty() { "Preparing transfer" } else { c.stage }, cx))
+                    .children((c.files_total > 0).then(|| motion::progress(c.progress_from, c.progress_to, c.progress_revision, cx)))
+                    .child(div().text_sm().text_color(muted).child(if c.live.is_some() { "Live transferred bytes include retries. Completion follows file verification." } else { "Waiting for live transfer statistics; completed files are still counted." }))
+                    .children(c.live.map(|sample| div().text_sm().text_color(muted).child(format!("{} transferred · {}/s", format::bytes(sample.bytes), format::bytes(sample.speed.max(0.0) as u64)))))
+                .child(div().text_color(muted).child(format!(
                         "{} of {} · {} of {}",
                         format::files(c.files_done),
                         format::files(c.files_total),
@@ -200,7 +243,7 @@ impl Render for DownloadForm {
                             .truncate()
                             .text_sm()
                             .text_color(muted)
-                            .child(c.current.clone()),
+                            .child(if c.current.is_empty() { String::new() } else { format!("Last processed: {}", c.current) }),
                     )
                     .child(
                         div()
@@ -209,11 +252,11 @@ impl Render for DownloadForm {
                             .text_color(muted)
                             .child(format!("Saving to {}", self.out.display())),
                     )
-                    .child(
-                        div().h_flex().justify_end().child(
-                            Button::new("stop")
+                    .footer(
+ div().h_flex().justify_end().child(
+                            button("stop")
                                 .label(if c.cancelling { "Stopping…" } else { "Cancel" })
-                                .disabled(c.cancelling)
+                                .disabled_feedback(c.cancelling)
                                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                         ),
                     )
@@ -233,12 +276,12 @@ impl Render for DownloadForm {
                 .child(Self::line(
                     IconName::TriangleAlert,
                     format!(
-                        "The file being downloaded may have left a temporary `.partial` file in {}.",
+                        "Completed files are kept in {}. The cancelled download was not published at its final name.",
                         self.out.display()
                     ),
                     muted,
                 ))
-                .child(close(cx))
+                .footer(close(cx))
                 .into_any_element(),
 
             Phase::Failed(message) => card()
@@ -248,7 +291,7 @@ impl Render for DownloadForm {
                     message.clone(),
                     danger,
                 ))
-                .child(close(cx))
+                .footer(close(cx))
                 .into_any_element(),
 
             Phase::Finished(report) => {
@@ -294,9 +337,17 @@ impl Render for DownloadForm {
                 card()
                     .child(title(if complete { "Done" } else { "Downloaded with problems" }))
                     .child(div().v_flex().gap_2().children(lines))
-                    .child(close(cx))
+                    .footer(close(cx))
                     .into_any_element()
             }
+        };
+        if matches!(
+            self.phase,
+            Phase::Finished(_) | Phase::Cancelled(_) | Phase::Failed(_)
+        ) {
+            motion::fade(content, "download-result", false, 1.0, cx)
+        } else {
+            content
         }
     }
 }

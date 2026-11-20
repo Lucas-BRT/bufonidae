@@ -4,6 +4,9 @@
 
 use std::sync::Arc;
 
+mod sync;
+pub use sync::SyncPreview;
+
 use bufonidae_core::account::{Account, AccountStore};
 use bufonidae_core::config::Config;
 use bufonidae_core::get;
@@ -37,6 +40,7 @@ pub struct Snapshot {
     /// Copies whose upload started and was never confirmed (an interrupted
     /// store). `reconcile` settles them.
     pub pending: usize,
+    pub jobs: Vec<index::Job>,
 }
 
 impl Snapshot {
@@ -62,8 +66,10 @@ impl Snapshot {
 }
 
 pub struct Backend {
+    pub(crate) tray: Option<crate::tray::Service>,
     runtime: Runtime,
     index: Arc<Index>,
+    sessions: Arc<tokio::sync::Mutex<SessionCache>>,
 }
 
 impl Backend {
@@ -81,9 +87,16 @@ impl Backend {
             index::Error::InUse => StartupError::InUse,
             e => other(&e),
         })?;
+        runtime
+            .block_on(index.interrupt_active_jobs())
+            .map_err(|e| other(&e))?;
+        let index = Arc::new(index);
+        let tray = Some(crate::tray::Service::new(&runtime, Arc::clone(&index)));
         Ok(Self {
+            tray,
             runtime,
-            index: Arc::new(index),
+            index,
+            sessions: Arc::new(tokio::sync::Mutex::new(SessionCache::default())),
         })
     }
 
@@ -98,12 +111,20 @@ impl Backend {
                 .to_vec();
             let files = index.list("").await.map_err(|e| e.to_string())?;
             let pending = index.pending().await.map_err(|e| e.to_string())?.len();
+            let jobs = index.jobs().await.map_err(|e| e.to_string())?;
             Ok(Snapshot {
                 accounts,
                 files,
                 pending,
+                jobs,
             })
         })
+    }
+
+    pub fn load_jobs(&self) -> JoinHandle<Result<Vec<index::Job>, String>> {
+        let index = Arc::clone(&self.index);
+        self.runtime
+            .spawn(async move { index.jobs().await.map_err(|e| e.to_string()) })
     }
 
     /// Looks at what was dropped and at the settings, without touching Mega.
@@ -144,60 +165,131 @@ impl Backend {
         let (tx, events) = unbounded_channel();
         let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let index = Arc::clone(&self.index);
+        let sessions = Arc::clone(&self.sessions);
         let result = self.runtime.spawn(async move {
-            let store =
-                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            let accounts = store.list().to_vec();
-            if accounts.is_empty() {
-                return Err("Connect a Mega account first.".to_owned());
-            }
-            let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+            let payload = serde_json::json!({
+                "paths": serde_json::to_value(&paths).map_err(|e| e.to_string())?,
+                "destination": dest,
+            })
+            .to_string();
+            let job_id = index
+                .enqueue_job("upload", &payload)
+                .await
                 .map_err(|e| e.to_string())?;
-
-            let Connected {
-                rcd,
-                usable,
-                unreachable,
-            } = connected_rcd(&store).await?;
-            let accounts = usable;
-            let outcome = async {
-                // A dropped sender is not a cancel request.
-                let cancelled = async {
-                    if cancel_rx.await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                };
-                let policy = MostFreeSpace::default();
-                // The receiver may be gone (window closed); the store goes on.
-                let mut observer = |progress| {
-                    let _ = tx.send(progress);
-                };
-                let store = put::put_observed(
-                    &rcd,
-                    &index,
-                    &accounts,
-                    &policy,
-                    &config,
-                    &paths,
-                    &dest,
-                    &mut observer,
-                );
-                tokio::pin!(store);
-                tokio::select! {
-                    report = &mut store => report
-                        .map(|mut r| {
-                            // Accounts that could not even sign in.
-                            r.unreachable.extend(unreachable.iter().cloned());
-                            StoreOutcome::Done(r)
-                        })
-                        .map_err(|e| e.to_string()),
-                    () = cancelled => Ok(StoreOutcome::Cancelled),
+            let _ = tx.send(TransferEvent::Stage("Waiting to start"));
+            let cancelled = async {
+                if cancel_rx.await.is_err() { std::future::pending::<()>().await; }
+            };
+            tokio::pin!(cancelled);
+            let mut cache = tokio::select! {
+                biased;
+                () = &mut cancelled => {
+                    index.set_job_state(&job_id, "cancelled", None).await.map_err(|e| e.to_string())?;
+                    return Ok(StoreOutcome::Cancelled);
                 }
+                cache = sessions.lock() => cache,
+            };
+            index
+                .set_job_state(&job_id, "running", None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let outcome = async {
+                let store =
+                    AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                let accounts = store.list().to_vec();
+                if accounts.is_empty() {
+                    return Err("Connect a Mega account first.".to_owned());
+                }
+                let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+
+                let _ = tx.send(TransferEvent::Stage("Connecting accounts"));
+                let connection = tokio::select! {
+                    biased;
+                    () = &mut cancelled => return Ok(StoreOutcome::Cancelled),
+                    connection = cache.checkout(&store) => connection?,
+                };
+                let _ = tx.send(TransferEvent::Stage("Planning files and checking destinations"));
+                let Connected {
+                    rcd,
+                    usable,
+                    unreachable,
+                } = &connection;
+                let accounts = usable;
+                // The daemon lease is exclusive: resetting counters cannot
+                // interfere with another transfer.
+                let live = tokio::time::timeout(std::time::Duration::from_secs(2), rcd.reset_transfer_stats()).await.is_ok_and(|result| result.is_ok());
+                if !live { let _ = tx.send(TransferEvent::Live(None)); }
+
+                let outcome = async {
+                    let policy = MostFreeSpace::default();
+                    // The receiver may be gone (window closed); the store goes on.
+                    let mut observer = |progress| {
+                        if matches!(progress, Progress::Planned { .. }) {
+                            let _ = tx.send(TransferEvent::Stage("Transferring files"));
+                        }
+                        let _ = tx.send(TransferEvent::Progress(progress));
+                    };
+                    let store = put::put_observed(
+                        rcd,
+                        &index,
+                        accounts,
+                        &policy,
+                        &config,
+                        &paths,
+                        &dest,
+                        &mut observer,
+                    );
+                    tokio::pin!(store);
+                    let telemetry = observe_transfer_bytes(rcd, &tx, live);
+                    tokio::pin!(telemetry);
+                    tokio::select! {
+                        () = &mut telemetry => Err("Transfer monitor stopped unexpectedly.".to_owned()),
+                        report = &mut store => report
+                            .map(|mut r| {
+                                // Accounts that could not even sign in.
+                                r.unreachable.extend(unreachable.iter().cloned());
+                                StoreOutcome::Done(r)
+                            })
+                            .map_err(|e| e.to_string()),
+                        () = &mut cancelled => Ok(StoreOutcome::Cancelled),
+                    }
+                }
+                .await;
+                // The cache retains successful sessions and stops cancelled transfers
+                // before another operation can lease the daemon.
+                cache
+                    .release(connection, matches!(&outcome, Ok(StoreOutcome::Done(_))))
+                    .await;
+                outcome
             }
             .await;
-            // Shutting rclone down is what actually stops a transfer in flight.
-            let _ = rcd.shutdown().await;
+            let (state, reason) = match &outcome {
+                Ok(StoreOutcome::Done(report)) if report.is_complete() => ("done", None),
+                Ok(StoreOutcome::Done(report)) => {
+                    let mut reasons = report.failed.iter().chain(&report.differs).map(|(path, error)| format!("{path}: {error}")).collect::<Vec<_>>();
+                    reasons.extend(report.no_room.iter().map(|path| format!("{path}: not enough free space for every copy")));
+                    ("failed", Some(reasons.join("\n")))
+                }
+                Ok(StoreOutcome::Cancelled) => ("cancelled", None),
+                Err(message) => ("failed", Some(message.clone())),
+            };
+            index
+                .set_job_state(&job_id, state, reason.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            let failed=state=="failed";
+            let cancelled=state=="cancelled";
+            let saved_reason=reason.clone();
+            let state=state.to_owned();
+            let detail=payload.clone();
+            tokio::spawn(async move {
+                if let Err(error)=crate::notifications::announce(failed,cancelled,&detail).await {
+                    let detail=format!("{}Desktop notification: {error}",saved_reason.map(|reason|format!("{reason}\n")).unwrap_or_default());
+                    let _=index.set_job_state(&job_id,&state,Some(&detail)).await;
+                }
+            });
             outcome
         });
         StoreJob {
@@ -209,51 +301,119 @@ impl Backend {
 
     /// Downloads `path` (a file or a folder, as stored) into `out`, following
     /// the core's rules: nothing local is overwritten, sizes are checked.
-    pub fn download(&self, path: String, out: PathBuf) -> DownloadJob {
+    pub fn download_selection(&self, paths: Vec<String>, out: PathBuf) -> DownloadJob {
         let (tx, events) = unbounded_channel();
         let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let index = Arc::clone(&self.index);
+        let sessions = Arc::clone(&self.sessions);
         let result = self.runtime.spawn(async move {
-            let store =
-                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            let accounts = store.list().to_vec();
-            if accounts.is_empty() {
-                return Err("Connect a Mega account first.".to_owned());
-            }
-            let Connected {
-                rcd,
-                usable,
-                unreachable,
-            } = connected_rcd(&store).await?;
-            let accounts = usable;
-            let outcome = async {
-                // A dropped sender is not a cancel request.
-                let cancelled = async {
-                    if cancel_rx.await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                };
-                let mut observer = |progress| {
-                    let _ = tx.send(progress);
-                };
-                let download =
-                    get::get_observed(&rcd, &index, &accounts, &path, &out, &mut observer);
-                tokio::pin!(download);
-                tokio::select! {
-                    report = &mut download => {
-                        report
-                            .map(|mut r| {
-                                r.unreachable.extend(unreachable.iter().cloned());
-                                DownloadOutcome::Done(r)
-                            })
-                            .map_err(|e| e.to_string())
-                    }
-                    () = cancelled => Ok(DownloadOutcome::Cancelled),
+            let payload =
+                serde_json::to_string(&(paths.clone(), out.clone())).map_err(|e| e.to_string())?;
+            let job_id = index
+                .enqueue_job("download", &payload)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = tx.send(TransferEvent::Stage("Waiting to start"));
+            let cancelled = async {
+                if cancel_rx.await.is_err() { std::future::pending::<()>().await; }
+            };
+            tokio::pin!(cancelled);
+            let mut cache = tokio::select! {
+                biased;
+                () = &mut cancelled => {
+                    index.set_job_state(&job_id, "cancelled", None).await.map_err(|e| e.to_string())?;
+                    return Ok(DownloadOutcome::Cancelled);
                 }
+                cache = sessions.lock() => cache,
+            };
+            index
+                .set_job_state(&job_id, "running", None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let outcome = async {
+                let store =
+                    AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                let accounts = store.list().to_vec();
+                if accounts.is_empty() {
+                    return Err("Connect a Mega account first.".to_owned());
+                }
+                let _ = tx.send(TransferEvent::Stage("Connecting accounts"));
+                let connection = tokio::select! {
+                    biased;
+                    () = &mut cancelled => return Ok(DownloadOutcome::Cancelled),
+                    connection = cache.checkout(&store) => connection?,
+                };
+                let _ = tx.send(TransferEvent::Stage("Planning files and checking destinations"));
+                let Connected {
+                    rcd,
+                    usable,
+                    unreachable,
+                } = &connection;
+                let accounts = usable;
+                // The daemon lease is exclusive: resetting counters cannot
+                // interfere with another transfer.
+                let live = tokio::time::timeout(std::time::Duration::from_secs(2), rcd.reset_transfer_stats()).await.is_ok_and(|result| result.is_ok());
+                if !live { let _ = tx.send(TransferEvent::Live(None)); }
+
+                let outcome = async {
+                    let mut observer = |progress| {
+                        if matches!(progress, get::Progress::Planned { .. }) {
+                            let _ = tx.send(TransferEvent::Stage("Transferring files"));
+                        }
+                        let _ = tx.send(TransferEvent::Progress(progress));
+                    };
+                    let download = async {
+                        if let [path]=paths.as_slice() { get::get_observed(rcd,&index,accounts,path,&out,&mut observer).await }
+                        else {get::get_selected_observed(rcd,&index,accounts,&paths,&out,&mut observer).await}
+                    };
+                    tokio::pin!(download);
+                    let telemetry = observe_transfer_bytes(rcd, &tx, live);
+                    tokio::pin!(telemetry);
+                    tokio::select! {
+                        () = &mut telemetry => Err("Transfer monitor stopped unexpectedly.".to_owned()),
+                        report = &mut download => {
+                            report
+                                .map(|mut r| {
+                                    r.unreachable.extend(unreachable.iter().cloned());
+                                    DownloadOutcome::Done(r)
+                                })
+                                .map_err(|e| e.to_string())
+                        }
+                        () = &mut cancelled => Ok(DownloadOutcome::Cancelled),
+                    }
+                }
+                .await;
+                cache
+                    .release(connection, matches!(&outcome, Ok(DownloadOutcome::Done(_))))
+                    .await;
+                outcome
             }
             .await;
-            let _ = rcd.shutdown().await;
+            let (state, reason) = match &outcome {
+                Ok(DownloadOutcome::Done(report)) if report.is_complete() => ("done", None),
+                Ok(DownloadOutcome::Done(report)) => {
+                    let reasons = report.failed.iter().map(|(path, error)| format!("{path}: {error}")).collect::<Vec<_>>();
+                    ("failed", Some(reasons.join("\n")))
+                }
+                Ok(DownloadOutcome::Cancelled) => ("cancelled", None),
+                Err(message) => ("failed", Some(message.clone())),
+            };
+            index
+                .set_job_state(&job_id, state, reason.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            let failed=state=="failed";
+            let cancelled=state=="cancelled";
+            let saved_reason=reason.clone();
+            let state=state.to_owned();
+            let detail=payload.clone();
+            tokio::spawn(async move {
+                if let Err(error)=crate::notifications::announce(failed,cancelled,&detail).await {
+                    let detail=format!("{}Desktop notification: {error}",saved_reason.map(|reason|format!("{reason}\n")).unwrap_or_default());
+                    let _=index.set_job_state(&job_id,&state,Some(&detail)).await;
+                }
+            });
             outcome
         });
         DownloadJob {
@@ -299,13 +459,53 @@ impl Backend {
     }
 
     /// Saves the "ask before storing more than this" limit.
-    pub fn save_large_upload_bytes(&self, bytes: u64) -> JoinHandle<Result<(), String>> {
+    pub fn save_large_upload_bytes(&self, bytes: u64) -> JoinHandle<Result<Config, String>> {
         self.runtime.spawn(async move {
             let path = Config::default_path().map_err(|e| e.to_string())?;
             let mut config = Config::load(path).map_err(|e| e.to_string())?;
             config
                 .set_large_upload_bytes(bytes)
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+    }
+
+    pub fn save_reduced_motion(&self, reduced: bool) -> JoinHandle<Result<Config, String>> {
+        self.runtime.spawn(async move {
+            let mut config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            config
+                .set_reduced_motion(reduced)
+                .map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+    }
+
+    pub fn save_desktop_options(
+        &self,
+        options: bufonidae_core::config::DesktopOptions,
+    ) -> JoinHandle<Result<Config, String>> {
+        self.runtime.spawn(async move {
+            let mut config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            config.set_desktop(options).map_err(|e| e.to_string())?;
+            Ok(config)
+        })
+    }
+
+    pub fn test_notification(
+        &self,
+        options: bufonidae_core::config::DesktopOptions,
+        failed: bool,
+    ) -> JoinHandle<Result<(), String>> {
+        self.runtime.spawn(async move {
+            crate::notifications::deliver(
+                &options,
+                "Bufonidae notification test",
+                "This test uses your unsaved notification and sound preferences.",
+                failed,
+            )
+            .await
         })
     }
 
@@ -313,7 +513,9 @@ impl Backend {
     /// false nothing is changed: it only reports.
     pub fn check_files(&self, apply: bool) -> JoinHandle<Result<CheckOutcome, String>> {
         let index = Arc::clone(&self.index);
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
             let store =
                 AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -322,23 +524,24 @@ impl Backend {
             }
             let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
+            let connection = cache.checkout(&store).await?;
             let Connected {
                 rcd,
                 usable,
                 unreachable,
-            } = connected_rcd(&store).await?;
+            } = &connection;
             let outcome = async {
-                let mut report = reconcile::reconcile(&rcd, &index, &usable, "", apply)
+                let mut report = reconcile::reconcile(rcd, &index, usable, "", apply)
                     .await
                     .map_err(|e| e.to_string())?;
-                report.unreachable.extend(unreachable);
-                let gaps = repair::find_gaps(&index, &usable, &config, "")
+                report.unreachable.extend(unreachable.iter().cloned());
+                let gaps = repair::find_gaps(&index, usable, &config, "")
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok::<_, String>(CheckOutcome { report, gaps })
             }
             .await;
-            let _ = rcd.shutdown().await;
+            cache.release(connection, outcome.is_ok()).await;
             outcome
         })
     }
@@ -346,7 +549,9 @@ impl Backend {
     /// Rebuilds the missing copies of files that have fewer than wanted.
     pub fn repair_copies(&self) -> JoinHandle<Result<repair::Report, String>> {
         let index = Arc::clone(&self.index);
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
             let store =
                 AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -355,34 +560,83 @@ impl Backend {
             }
             let config = Config::load(Config::default_path().map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
+            let connection = cache.checkout(&store).await?;
             let Connected {
                 rcd,
                 usable,
                 unreachable,
-            } = connected_rcd(&store).await?;
-            let result = repair::repair(
-                &rcd,
-                &index,
-                &usable,
-                &MostFreeSpace::default(),
-                &config,
-                "",
-            )
-            .await
-            .map_err(|e| e.to_string())
-            .map(|mut report| {
-                report.unreachable.extend(unreachable);
-                report
-            });
-            let _ = rcd.shutdown().await;
+            } = &connection;
+            let result =
+                repair::repair(rcd, &index, usable, &MostFreeSpace::default(), &config, "")
+                    .await
+                    .map_err(|e| e.to_string())
+                    .map(|mut report| {
+                        report.unreachable.extend(unreachable.iter().cloned());
+                        report
+                    });
+            cache.release(connection, result.is_ok()).await;
             result
         })
     }
 
+    /// Deep verification downloads replicas; cancellation stops its daemon.
+    pub fn verify_copies(&self) -> VerificationJob {
+        let index = Arc::clone(&self.index);
+        let sessions = Arc::clone(&self.sessions);
+        let (cancel, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, events) = unbounded_channel();
+        let result = self.runtime.spawn(async move {
+            let cancelled = async {
+                if cancel_rx.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(cancelled);
+            let _ = tx.send("Waiting for the active operation to finish");
+            let mut cache = tokio::select! {
+                biased;
+                () = &mut cancelled => return Ok(None),
+                cache = sessions.lock() => cache,
+            };
+            let store =
+                AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            let _ = tx.send("Connecting accounts for verification");
+            let connection = tokio::select! {
+                biased;
+                () = &mut cancelled => return Ok(None),
+                connection = cache.checkout(&store) => connection?,
+            };
+            let Connected { rcd, usable, .. } = &connection;
+            let _ = tx.send("Downloading and verifying indexed copies");
+            let outcome = {
+                let verify = bufonidae_core::verify::verify(rcd, &index, usable, "");
+                tokio::pin!(verify);
+                tokio::select! {
+                    biased;
+                    () = &mut cancelled => Ok(None),
+                    report = &mut verify => report.map(Some).map_err(|e| e.to_string()),
+                }
+            };
+            cache
+                .release(connection, matches!(&outcome, Ok(Some(_))))
+                .await;
+            outcome
+        });
+        VerificationJob {
+            cancel,
+            events,
+            result,
+        }
+    }
+
     /// Asks every account how much space it has. This signs in to each one, so
-    /// it runs when the user asks, not on every start.
+    /// the desktop requests this once after loading accounts or on explicit refresh.
     pub fn check_health(&self) -> JoinHandle<Result<Vec<AccountHealth>, String>> {
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
+            cache.invalidate().await;
             let store =
                 AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -430,7 +684,10 @@ impl Backend {
         password: String,
         two_fa: Option<String>,
     ) -> JoinHandle<Result<(), String>> {
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
+            cache.invalidate().await;
             let store =
                 AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -447,7 +704,10 @@ impl Backend {
     /// Forgets an account and its stored secrets. Files stay in the Mega
     /// account; the index keeps its record of them.
     pub fn remove_account(&self, label: String) -> JoinHandle<Result<(), String>> {
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
+            cache.invalidate().await;
             let mut store =
                 AccountStore::load(AccountStore::default_path().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -462,7 +722,10 @@ impl Backend {
     /// Connects a Mega account: proves the login through rclone, then stores
     /// the account and its secrets. Nothing is kept when it fails.
     pub fn add_account(&self, request: NewAccount) -> JoinHandle<Result<(), String>> {
+        let sessions = Arc::clone(&self.sessions);
         self.runtime.spawn(async move {
+            let mut cache = sessions.lock().await;
+            cache.invalidate().await;
             let path = AccountStore::default_path().map_err(|e| e.to_string())?;
             let mut store = AccountStore::load(path).map_err(|e| e.to_string())?;
             // Cheap checks first, so a typo does not wait for a login attempt.
@@ -511,11 +774,23 @@ pub enum StoreOutcome {
 }
 
 /// A running store job: progress events, a way to cancel, then the result.
+pub enum TransferEvent<T> {
+    Stage(&'static str),
+    Progress(T),
+    Live(Option<bufonidae_rclone::rcd::TransferStats>),
+}
+
 pub struct StoreJob {
-    pub events: UnboundedReceiver<Progress>,
+    pub events: UnboundedReceiver<TransferEvent<Progress>>,
     /// Sending on it asks the job to stop.
     pub cancel: tokio::sync::oneshot::Sender<()>,
     pub result: JoinHandle<Result<StoreOutcome, String>>,
+}
+
+pub struct VerificationJob {
+    pub events: UnboundedReceiver<&'static str>,
+    pub cancel: tokio::sync::oneshot::Sender<()>,
+    pub result: JoinHandle<Result<Option<bufonidae_core::verify::Report>, String>>,
 }
 
 /// How a download job ended.
@@ -528,7 +803,7 @@ pub enum DownloadOutcome {
 
 /// A running download job: progress events, a way to cancel, then the result.
 pub struct DownloadJob {
-    pub events: UnboundedReceiver<get::Progress>,
+    pub events: UnboundedReceiver<TransferEvent<get::Progress>>,
     pub cancel: tokio::sync::oneshot::Sender<()>,
     pub result: JoinHandle<Result<DownloadOutcome, String>>,
 }
@@ -546,6 +821,27 @@ async fn start_rclone() -> Result<Rcd, String> {
         })
 }
 
+/// Poll concurrently with the transfer, never blocking its cancellation.
+async fn observe_transfer_bytes<T>(
+    rcd: &Rcd,
+    tx: &tokio::sync::mpsc::UnboundedSender<TransferEvent<T>>,
+    enabled: bool,
+) {
+    if !enabled {
+        std::future::pending::<()>().await;
+    }
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let sample = tokio::time::timeout(std::time::Duration::from_secs(2), rcd.transfer_stats())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let _ = tx.send(TransferEvent::Live(sample));
+    }
+}
+
 /// rclone with the accounts that could be defined in it.
 struct Connected {
     rcd: Rcd,
@@ -553,6 +849,46 @@ struct Connected {
     usable: Vec<Account>,
     /// Accounts that could not be reached, with why: `(label, reason)`.
     unreachable: Vec<(String, String)>,
+}
+
+/// One lease at a time: a cancelled operation can stop its daemon without
+/// affecting another transfer, and placement never reserves the same space twice.
+#[derive(Default)]
+struct SessionCache {
+    accounts: Vec<Account>,
+    connection: Option<Connected>,
+}
+
+impl SessionCache {
+    async fn checkout(&mut self, store: &AccountStore) -> Result<Connected, String> {
+        if let Some(mut connection) = self.connection.take() {
+            if self.accounts == store.list()
+                && connection.unreachable.is_empty()
+                && connection.rcd.is_running().map_err(|e| e.to_string())?
+            {
+                return Ok(connection);
+            }
+            let _ = connection.rcd.shutdown().await;
+        }
+        let connection = connected_rcd(store).await?;
+        self.accounts = store.list().to_vec();
+        Ok(connection)
+    }
+
+    async fn release(&mut self, connection: Connected, reusable: bool) {
+        if reusable {
+            self.connection = Some(connection);
+        } else {
+            let _ = connection.rcd.shutdown().await;
+        }
+    }
+
+    async fn invalidate(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.rcd.shutdown().await;
+        }
+        self.accounts.clear();
+    }
 }
 
 /// Starts rclone and defines every stored account in it. An account that fails
@@ -698,6 +1034,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queued_download_can_be_cancelled_without_waiting_for_the_active_operation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let index = runtime.block_on(Index::open_memory()).unwrap();
+        let backend = Backend {
+            tray: None,
+            runtime,
+            index: Arc::new(index),
+            sessions: Arc::new(tokio::sync::Mutex::new(SessionCache::default())),
+        };
+        // An earlier operation owns the daemon. Cancellation must not wait for
+        // it or access account credentials before acquiring its own lease.
+        let active = backend
+            .runtime
+            .block_on(Arc::clone(&backend.sessions).lock_owned());
+        let out = tempfile::tempdir().unwrap();
+        let job = backend.download_selection(vec!["Docs/file".into()], out.path().to_owned());
+        job.cancel.send(()).unwrap();
+        let outcome = backend.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                job.result.await.unwrap().unwrap()
+            })
+            .await
+        });
+        assert!(matches!(outcome, Ok(DownloadOutcome::Cancelled)));
+        let jobs = backend.runtime.block_on(backend.index.jobs()).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, "cancelled");
+        assert!(std::fs::read_dir(out.path()).unwrap().next().is_none());
+        drop(active);
+    }
+
+    #[test]
+    fn queued_verification_cancel_does_not_access_accounts_or_wait_for_the_daemon() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let index = runtime.block_on(Index::open_memory()).unwrap();
+        let backend = Backend {
+            tray: None,
+            runtime,
+            index: Arc::new(index),
+            sessions: Arc::new(tokio::sync::Mutex::new(SessionCache::default())),
+        };
+        let active = backend
+            .runtime
+            .block_on(Arc::clone(&backend.sessions).lock_owned());
+        let job = backend.verify_copies();
+        job.cancel.send(()).unwrap();
+        let outcome = backend
+            .runtime
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    job.result.await.unwrap().unwrap()
+                })
+                .await
+            })
+            .unwrap();
+        assert!(outcome.is_none());
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn cached_daemon_keeps_remotes_and_invalidation_discards_it() {
+        let rcd = match Rcd::start("rclone").await {
+            Ok(rcd) => rcd,
+            Err(RcloneError::Spawn(_))
+                if std::env::var_os("BUFONIDAE_REQUIRE_RCLONE").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not start local rclone: {error}"),
+        };
+        rcd.config_create("sentinel", "local", &serde_json::Map::new())
+            .await
+            .unwrap();
+        let mut cache = SessionCache::default();
+        let connection = Connected {
+            rcd,
+            usable: Vec::new(),
+            unreachable: Vec::new(),
+        };
+        cache.release(connection, true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::load(dir.path().join("accounts.toml")).unwrap();
+        let connection = cache.checkout(&store).await.unwrap();
+        assert!(cache.connection.is_none());
+        let remote = connection.rcd.config_get("sentinel").await.unwrap();
+        assert_eq!(remote.get("type").map(String::as_str), Some("local"));
+        cache.release(connection, true).await;
+        cache.invalidate().await;
+        assert!(cache.connection.is_none());
+        assert!(cache.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_operation_does_not_return_a_daemon_to_the_cache() {
+        let rcd = match Rcd::start("rclone").await {
+            Ok(rcd) => rcd,
+            Err(RcloneError::Spawn(_))
+                if std::env::var_os("BUFONIDAE_REQUIRE_RCLONE").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("could not start local rclone: {error}"),
+        };
+        let mut cache = SessionCache::default();
+        cache
+            .release(
+                Connected {
+                    rcd,
+                    usable: Vec::new(),
+                    unreachable: Vec::new(),
+                },
+                false,
+            )
+            .await;
+        assert!(cache.connection.is_none());
+    }
+
+    #[test]
     fn counts_files_that_exist_on_one_account_only() {
         let file = |path: &str, accounts: &[&str]| IndexedFile {
             path: path.to_owned(),
@@ -708,6 +1168,7 @@ mod tests {
         let snapshot = Snapshot {
             accounts: Vec::new(),
             pending: 0,
+            jobs: Vec::new(),
             files: vec![
                 file("only-a", &["a"]),
                 file("both", &["a", "b"]),

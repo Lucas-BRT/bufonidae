@@ -15,5 +15,7 @@ pub mod paths;
 pub mod placement;
 pub mod put;
 pub mod reconcile;
+pub mod redistribute;
 pub mod repair;
 pub mod secrets;
+pub mod verify;

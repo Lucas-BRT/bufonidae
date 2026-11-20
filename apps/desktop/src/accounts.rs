@@ -1,19 +1,24 @@
 //! The Accounts screen: each connected account, how full it is, and the
 //! actions on it (sign in again, remove).
 
-use gpui::{Context, IntoElement, ParentElement as _, Styled as _, Window, div, px};
+use crate::interaction::{ControlFeedback as _, button};
+
+use gpui::{
+    Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, StyledExt as _,
-    button::{Button, ButtonVariants as _},
-    progress::Progress,
+    ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
 };
 
 use crate::app::{BufonidaeApp, Health, centered};
 use crate::backend::HealthStatus;
 use crate::format;
+use crate::ui::{self, Tone};
 
-/// Below this share free, an account is called almost full.
-const ALMOST_FULL: f32 = 0.10;
+/// At or above these shares used, an account is almost full / nearly full.
+const ALMOST_FULL_PERCENT: f32 = 90.0;
+const FULL_PERCENT: f32 = 95.0;
 
 impl BufonidaeApp {
     pub(crate) fn accounts_screen(
@@ -23,25 +28,24 @@ impl BufonidaeApp {
     ) -> impl IntoElement {
         let snapshot = self.snapshot().cloned().unwrap_or_default();
         let theme = cx.theme();
-        let (muted, danger, border, surface, accent_bg, accent_fg) = (
+        let (muted, danger, border, surface) = (
             theme.muted_foreground,
             theme.danger,
             theme.border,
             theme.popover,
-            theme.accent,
-            theme.accent_foreground,
         );
 
         let checking = matches!(self.health, Health::Checking);
-        let add_button = Button::new("add-account")
+        let add_button = button("add-account")
             .primary()
             .icon(IconName::Plus)
             .label("Add account")
             .on_click(cx.listener(|this, _, window, cx| this.open_add_account(window, cx)));
-        let check_button = Button::new("check-accounts")
+        let check_button = button("check-accounts")
             .icon(IconName::LoaderCircle)
             .label(if checking { "Checking…" } else { "Check" })
-            .loading(checking)
+            .loading(checking && crate::motion::enabled(cx))
+            .disabled_feedback(checking)
             .tooltip("Ask each account how much space it has")
             .on_click(cx.listener(|this, _, _, cx| this.check_health(cx)));
 
@@ -87,19 +91,14 @@ impl BufonidaeApp {
 
         let banner = match &self.health {
             Health::Failed(message) => Some(
-                div()
-                    .h_flex()
-                    .items_start()
-                    .gap_2()
-                    .px_6()
-                    .pb_3()
-                    .text_color(danger)
-                    .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(format!("Could not check the accounts: {message}")),
-                    ),
+                ui::notice(
+                    Tone::Danger,
+                    format!("Could not check the accounts: {message}"),
+                    None,
+                    cx,
+                )
+                .mx_6()
+                .mb_3(),
             ),
             _ => None,
         };
@@ -122,7 +121,7 @@ impl BufonidaeApp {
                         .into_any_element(),
                 ),
                 (_, Some(HealthStatus::Ok { total, used, free })) => {
-                    Some(space_line(*total, *used, *free, muted, danger))
+                    Some(space_line(*total, *used, *free, (muted, danger), (i, cx)))
                 }
                 (_, Some(HealthStatus::Unreachable(why))) => Some(
                     div()
@@ -132,7 +131,12 @@ impl BufonidaeApp {
                         .text_sm()
                         .text_color(danger)
                         .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                        .child(div().flex_1().child(format!("Could not be reached: {why}")))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(format!("Could not be reached: {why}")),
+                        )
                         .into_any_element(),
                 ),
                 _ => None,
@@ -143,11 +147,32 @@ impl BufonidaeApp {
                 account.email.clone(),
                 account.id.clone(),
             );
+            let status = match (&self.health, self.health.of(&account.id)) {
+                (Health::Checking, _) => Some(ui::chip(
+                    Tone::Neutral,
+                    Some(IconName::Loader),
+                    "Checking",
+                    cx,
+                )),
+                (_, Some(HealthStatus::Ok { total, used, free })) => Some(
+                    if used_percent(*total, *used, *free).is_some_and(|p| p >= ALMOST_FULL_PERCENT)
+                    {
+                        ui::chip(Tone::Warning, None, "Almost full", cx)
+                    } else {
+                        ui::chip(Tone::Success, None, "Connected", cx)
+                    },
+                ),
+                (_, Some(HealthStatus::Unreachable(_))) => {
+                    Some(ui::chip(Tone::Danger, None, "Unreachable", cx))
+                }
+                _ => None,
+            };
             let actions = div()
                 .h_flex()
-                .gap_1()
+                .flex_none()
+                .gap_4()
                 .child(
-                    Button::new(("reauth", i))
+                    button(("reauth", i))
                         .ghost()
                         .compact()
                         .label("Sign in again")
@@ -156,11 +181,14 @@ impl BufonidaeApp {
                         })),
                 )
                 .child(
-                    Button::new(("remove", i))
+                    button(("remove", i))
                         .ghost()
                         .compact()
+                        .text_color(danger)
                         .label("Remove")
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_remove(&id, cx))),
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_remove(&id, window, cx)
+                        })),
                 );
 
             div()
@@ -174,14 +202,17 @@ impl BufonidaeApp {
                 .child(
                     div()
                         .h_flex()
+                        .flex_wrap()
                         .items_center()
-                        .gap_4()
+                        .gap_x_4()
+                        .gap_y_2()
                         .child(
                             div()
                                 .size_10()
+                                .flex_none()
                                 .rounded_full()
-                                .bg(accent_bg)
-                                .text_color(accent_fg)
+                                .bg(avatar_color(&account.id))
+                                .text_color(gpui::white())
                                 .font_semibold()
                                 .flex()
                                 .items_center()
@@ -192,21 +223,22 @@ impl BufonidaeApp {
                             div()
                                 .v_flex()
                                 .flex_1()
-                                .min_w(px(0.0))
-                                .child(div().font_medium().child(account.label.clone()))
+                                .min_w(px(160.0))
+                                .child(div().truncate().font_medium().child(account.label.clone()))
                                 .child(
                                     div()
-                                        .truncate()
+                                        .min_w(px(0.0))
                                         .text_sm()
                                         .text_color(muted)
                                         .child(account.email.clone()),
-                                ),
+                                )
+                                .child(div().text_sm().text_color(muted).child(format!(
+                                    "{} · {}",
+                                    format::files(count),
+                                    format::bytes(bytes)
+                                ))),
                         )
-                        .child(div().text_color(muted).child(format!(
-                            "{} · {}",
-                            format::files(count),
-                            format::bytes(bytes)
-                        )))
+                        .children(status)
                         .child(actions),
                 )
                 .children(health_line)
@@ -217,21 +249,50 @@ impl BufonidaeApp {
             .size_full()
             .child(header)
             .children(banner)
-            .child(div().v_flex().gap_3().px_6().pb_6().children(rows))
+            .child(
+                div()
+                    .id("accounts-body")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .child(div().v_flex().gap_3().px_6().pb_6().children(rows)),
+            )
     }
 }
 
-/// A usage bar and a sentence: "12.3 GB free of 20 GB".
+/// The share used, as a percentage, when the account reports enough to say.
+fn used_percent(total: Option<u64>, used: Option<u64>, free: Option<u64>) -> Option<f32> {
+    let free = free.or_else(|| total.zip(used).map(|(t, u)| t.saturating_sub(u)))?;
+    let total = total.filter(|&t| t > 0)?;
+    #[allow(clippy::cast_precision_loss)]
+    Some(((1.0 - free as f32 / total as f32) * 100.0).clamp(0.0, 100.0))
+}
+
+/// A stable hue per account, dark enough for white initials (above 7:1).
+fn avatar_color(id: &str) -> gpui::Hsla {
+    let hash = id.bytes().fold(2_166_136_261_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    });
+    #[allow(clippy::cast_precision_loss)]
+    gpui::hsla((hash % 360) as f32 / 360.0, 0.45, 0.30, 1.0)
+}
+
+/// A usage bar and a sentence: "12.3 GB free of 20 GB". The bar turns warning
+/// at 90% and danger at 95%; the icon and words say so as well.
 fn space_line(
     total: Option<u64>,
     used: Option<u64>,
     free: Option<u64>,
-    muted: gpui::Hsla,
-    danger: gpui::Hsla,
+    (muted, danger): (gpui::Hsla, gpui::Hsla),
+    (index, cx): (usize, &gpui::App),
 ) -> gpui::AnyElement {
     // Mega reports used and total; free may be absent, so derive it.
     let free = free.or_else(|| total.zip(used).map(|(t, u)| t.saturating_sub(u)));
-    let (Some(total), Some(free)) = (total.filter(|&t| t > 0), free) else {
+    let (Some(total), Some(free), Some(percent)) = (
+        total.filter(|&t| t > 0),
+        free,
+        used_percent(total, used, free),
+    ) else {
         let text = match used {
             Some(used) => format!("{} used (the total is not reported)", format::bytes(used)),
             None => "Space is not reported by this account".to_owned(),
@@ -242,21 +303,29 @@ fn space_line(
             .child(text)
             .into_any_element();
     };
-    #[allow(clippy::cast_precision_loss)]
-    let share_free = free as f32 / total as f32;
-    let used_percent = ((1.0 - share_free) * 100.0).clamp(0.0, 100.0);
-    let almost_full = share_free < ALMOST_FULL;
+    let almost_full = percent >= ALMOST_FULL_PERCENT;
+    let bar = if percent >= FULL_PERCENT {
+        Some(Tone::Danger.accent(cx))
+    } else if almost_full {
+        Some(Tone::Warning.accent(cx))
+    } else {
+        None
+    };
     div()
         .v_flex()
         .gap_1p5()
-        .child(Progress::new().value(used_percent))
+        .child(crate::motion::fill(("space-fill", index), percent, bar, cx))
         .child(
             div()
                 .h_flex()
                 .items_center()
                 .gap_2()
                 .text_sm()
-                .text_color(if almost_full { danger } else { muted })
+                .text_color(if percent >= FULL_PERCENT {
+                    danger
+                } else {
+                    muted
+                })
                 .children(
                     almost_full.then(|| Icon::new(IconName::TriangleAlert).size_4().flex_none()),
                 )
