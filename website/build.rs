@@ -3,6 +3,8 @@ use std::{env, fs, path::Path};
 use topcoat::tailwind::BuildConfig;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=assets/style.css");
     let config = BuildConfig::new().input("styles.css");
     // The Docker build points this at a musl Tailwind CLI; elsewhere Topcoat
     // downloads its pinned glibc one.

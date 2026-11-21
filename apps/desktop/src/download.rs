@@ -228,7 +228,11 @@ impl Render for DownloadForm {
                         "Downloading"
                     }))
                     .child(motion::activity(if c.cancelling { "Cancelling — waiting for the transfer to stop" } else if c.stage.is_empty() { "Preparing transfer" } else { c.stage }, cx))
-                    .children((c.files_total > 0).then(|| motion::progress(c.progress_from, c.progress_to, c.progress_revision, cx)))
+                    .children((c.files_total > 0).then(|| {
+                        div().w_full().flex_none().child(motion::progress(
+                            c.progress_from, c.progress_to, c.progress_revision, cx,
+                        ))
+                    }))
                     .child(div().text_sm().text_color(muted).child(if c.live.is_some() { "Live transferred bytes include retries. Completion follows file verification." } else { "Waiting for live transfer statistics; completed files are still counted." }))
                     .children(c.live.map(|sample| div().text_sm().text_color(muted).child(format!("{} transferred · {}/s", format::bytes(sample.bytes), format::bytes(sample.speed.max(0.0) as u64)))))
                 .child(div().text_color(muted).child(format!(

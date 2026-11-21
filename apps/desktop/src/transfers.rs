@@ -9,9 +9,12 @@ use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::{ActiveTheme as _, Icon, IconName, StyledExt as _};
 
 use crate::app::{BufonidaeApp, centered};
+use crate::backend::HealthStatus;
+use crate::commands::Command;
 use crate::format;
 use crate::ui::{self, Tone};
 
@@ -279,8 +282,26 @@ impl BufonidaeApp {
         let action = recoverable.then(|| {
             let job = job.clone();
             let button = button(("review-transfer", i)).flex_none();
-            let button = if job.operation == "download" {
-                button.label("Retry").tooltip("Retry download")
+            let needs_account = job.operation == "download"
+                && self.snapshot().is_some_and(|snapshot| {
+                    snapshot.accounts.iter().all(|account| {
+                        matches!(
+                            self.health.of(&account.id),
+                            Some(HealthStatus::Unreachable(_))
+                        )
+                    })
+                });
+            let button = if needs_account {
+                return button.label("Open Accounts").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.execute_command(Command::Accounts, window, cx);
+                    },
+                ));
+            } else if job.operation == "download" {
+                button
+                    .ghost()
+                    .icon(Icon::empty().path("icons/rotate-cw.svg"))
+                    .tooltip("Retry")
             } else {
                 button.label("Review upload")
             };

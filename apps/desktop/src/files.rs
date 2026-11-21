@@ -25,7 +25,8 @@ use bufonidae_core::config::{FileFilter, FileSort};
 
 /// Width of the "Open" slot, kept for files too so sizes stay aligned.
 const OPEN_SLOT: f32 = 64.0;
-const SIZE_SLOT: f32 = 84.0;
+const TYPE_SLOT: f32 = 72.0;
+const SIZE_SLOT: f32 = 100.0;
 const ACTION_SLOT: f32 = 36.0;
 /// Height of the column-head row, the same with or without a selection.
 const LIST_HEAD: f32 = 44.0;
@@ -367,7 +368,8 @@ impl BufonidaeApp {
                             .border_dashed()
                             .border_color(border)
                             .text_color(muted)
-                            .text_center()
+                            .h_flex()
+                            .justify_center()
                             .child("Drop files or folders here"),
                     ),
                 );
@@ -489,6 +491,14 @@ impl BufonidaeApp {
                             .child(name_head),
                     )
                     .child(div().w(px(OPEN_SLOT)).flex_none())
+                    .child(
+                        div()
+                            .w(px(TYPE_SLOT))
+                            .flex_none()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Type"),
+                    )
                     .child(
                         div()
                             .w(px(SIZE_SLOT))
@@ -627,8 +637,10 @@ impl BufonidaeApp {
                                         div()
                                             .flex_1()
                                             .min_w(px(0.0))
-                                            .truncate()
-                                            .child(name.clone()),
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(format::middle_truncate(&name, 34)),
                                     )
                                     .children(
                                         (arrived && reduced)
@@ -649,9 +661,19 @@ impl BufonidaeApp {
                             ))
                             .child(
                                 div()
+                                    .w(px(TYPE_SLOT))
+                                    .flex_none()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format::file_type(&name, is_folder)),
+                            )
+                            .child(
+                                div()
                                     .w(px(SIZE_SLOT))
                                     .flex_none()
                                     .text_right()
+                                    .whitespace_nowrap()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(format::bytes(row.bytes())),
                             )

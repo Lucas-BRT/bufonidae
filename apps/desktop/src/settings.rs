@@ -321,9 +321,8 @@ impl Render for SettingsView {
                         .child(child)
                 }))
         };
-        let title = div().text_xl().font_semibold().child("Settings");
-
         if let Some(message) = &self.load_error {
+            let title = div().text_xl().font_semibold().child("Settings");
             return div().v_flex().size_full().child(div().px_6().py_3().child(title)).child(
                 div().px_6().v_flex().gap_3()
                     .child(div().h_flex().items_start().gap_2().text_color(danger)
@@ -334,6 +333,7 @@ impl Render for SettingsView {
             );
         }
         let Some(current) = self.config.clone() else {
+            let title = div().text_xl().font_semibold().child("Settings");
             return div()
                 .v_flex()
                 .size_full()
@@ -465,7 +465,6 @@ impl Render for SettingsView {
             .gap_y_1()
             .px_6()
             .py_2()
-            .child(title.flex_none())
             .child(jumps);
         let save_bar = self.save_bar(cx);
         div()

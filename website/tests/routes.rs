@@ -68,6 +68,11 @@ async fn every_doc_page_lists_all_the_docs() {
     for path in DOCS {
         let body = page(path).await;
         assert!(body.contains("aria-label=\"Documentation\""), "{path}");
+        assert_eq!(body.matches(" aria-current=\"page\"").count(), 1, "{path}");
+        assert!(
+            body.contains(&format!("href=\"{path}\" aria-current=\"page\"")),
+            "{path}"
+        );
         for target in DOCS {
             assert!(
                 body.contains(&format!("href=\"{target}\"")),

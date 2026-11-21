@@ -192,14 +192,18 @@ impl BufonidaeApp {
                 crate::distribution::DistributionView::new(Arc::clone(&backend), window, cx)
             }));
             if let Some(view) = &app.distribution {
-                cx.subscribe(
+                cx.subscribe_in(
                     view,
-                    |this, _, event: &crate::distribution::DistributionEvent, cx| {
+                    window,
+                    |this, _, event: &crate::distribution::DistributionEvent, window, cx| {
                         match event {
                             crate::distribution::DistributionEvent::Started => {
                                 this.refresh_transfers(cx)
                             }
                             crate::distribution::DistributionEvent::Finished => this.reload(cx),
+                            crate::distribution::DistributionEvent::OpenCheck => {
+                                this.execute_command(Command::Check, window, cx);
+                            }
                             crate::distribution::DistributionEvent::Health(health) => {
                                 this.health = Health::Ready(health.clone())
                             }
@@ -294,7 +298,12 @@ impl BufonidaeApp {
         app
     }
 
-    fn execute_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn execute_command(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = match command {
             Command::Files | Command::Search => Some(Screen::Files),
             Command::Accounts => Some(Screen::Accounts),
@@ -1099,6 +1108,35 @@ impl BufonidaeApp {
             ))
             .on_click(cx.listener(|this, _, window, cx| this.open_commands(true, window, cx)));
         if collapsed {
+            let compact_badge =
+                |count: usize, btn: gpui_component::button::Button, cx: &Context<Self>| {
+                    div()
+                        .relative()
+                        .w_8()
+                        .child(btn)
+                        .children((count > 0).then(|| {
+                            div()
+                                .absolute()
+                                .top(px(-2.0))
+                                .right(px(-2.0))
+                                .min_w(px(16.0))
+                                .h(px(16.0))
+                                .px_1()
+                                .rounded_full()
+                                .bg(cx.theme().primary)
+                                .text_color(cx.theme().primary_foreground)
+                                .text_xs()
+                                .font_semibold()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(if count > 99 {
+                                    "99+".to_owned()
+                                } else {
+                                    count.to_string()
+                                })
+                        }))
+                };
             return div()
                 .v_flex()
                 .w(px(56.0))
@@ -1115,8 +1153,16 @@ impl BufonidaeApp {
                 .child(div().h_3())
                 .child(item("Files", IconName::Folder, Screen::Files, cx))
                 .child(item("Accounts", IconName::CircleUser, Screen::Accounts, cx))
-                .child(item("Check", IconName::CircleCheck, Screen::Check, cx))
-                .child(item("Transfers", IconName::Inbox, Screen::Transfers, cx))
+                .child(compact_badge(
+                    pending,
+                    item("Check", IconName::CircleCheck, Screen::Check, cx),
+                    cx,
+                ))
+                .child(compact_badge(
+                    queued,
+                    item("Transfers", IconName::Inbox, Screen::Transfers, cx),
+                    cx,
+                ))
                 .child(item("Settings", IconName::Settings, Screen::Settings, cx))
                 .child(div().flex_1().min_h(px(0.0)))
                 .child(self.storage_indicator(true, cx))

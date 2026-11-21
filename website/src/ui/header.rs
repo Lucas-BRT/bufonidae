@@ -13,8 +13,9 @@ use crate::{
     site,
 };
 
-/// A link of the main menu that is marked when its section is the page.
-const CURRENT: StaticClass = class!("aria-[current=page]:bg-card aria-[current=page]:text-primary");
+/// Visually mark the documentation section in the main menu.
+const CURRENT: StaticClass =
+    class!("data-[section-active=true]:bg-card data-[section-active=true]:text-primary");
 
 #[component]
 pub async fn site_header(cx: &Cx) -> Result<impl View> {
@@ -36,7 +37,7 @@ pub async fn site_header(cx: &Cx) -> Result<impl View> {
                 </a>
                 <nav aria-label="Main">
                     <ul class="m-0 flex list-none items-center gap-1 p-0">
-                        <li class="m-0"><a class=(menu()) href=(href!(install::page)) aria-current=(in_docs.then_some("page"))>"Docs"</a></li>
+                        <li class="m-0"><a class=(menu()) href=(href!(install::page)) data-section-active=(in_docs.then_some("true"))>"Docs"</a></li>
                         <li class="m-0"><a class=(menu()) href=(REPO)>"GitHub"</a></li>
                     </ul>
                 </nav>

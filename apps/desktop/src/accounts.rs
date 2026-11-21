@@ -202,10 +202,9 @@ impl BufonidaeApp {
                 .child(
                     div()
                         .h_flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_x_4()
-                        .gap_y_2()
+                        .min_w(px(0.0))
+                        .items_start()
+                        .gap_4()
                         .child(
                             div()
                                 .size_10()
@@ -223,8 +222,8 @@ impl BufonidaeApp {
                             div()
                                 .v_flex()
                                 .flex_1()
-                                .min_w(px(160.0))
-                                .child(div().truncate().font_medium().child(account.label.clone()))
+                                .min_w(px(0.0))
+                                .child(div().font_medium().child(account.label.clone()))
                                 .child(
                                     div()
                                         .min_w(px(0.0))
@@ -237,7 +236,13 @@ impl BufonidaeApp {
                                     format::files(count),
                                     format::bytes(bytes)
                                 ))),
-                        )
+                        ),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_2()
                         .children(status)
                         .child(actions),
                 )

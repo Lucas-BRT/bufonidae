@@ -29,6 +29,7 @@ use std::{
 pub enum DistributionEvent {
     Started,
     Finished,
+    OpenCheck,
     Health(Vec<AccountHealth>),
 }
 impl EventEmitter<DistributionEvent> for DistributionView {}
@@ -46,6 +47,7 @@ pub struct DistributionView {
     approved: bool,
     message: Option<String>,
     error: bool,
+    sync_failed: bool,
     cancel: Option<Arc<AtomicBool>>,
     progress: Option<Progress>,
     live: Option<bufonidae_rclone::rcd::TransferStats>,
@@ -108,6 +110,7 @@ impl DistributionView {
             approved: false,
             message: None,
             error: false,
+            sync_failed: false,
             cancel: None,
             progress: None,
             live: None,
@@ -128,6 +131,7 @@ impl DistributionView {
             self.approved = false;
             self.detail = None;
             self.message = None;
+            self.sync_failed = false;
         }
     }
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -295,6 +299,7 @@ impl DistributionView {
                 this.cancel = None;
                 this.preview = None;
                 this.approved = false;
+                let sync_failed = result.is_err();
                 this.message = Some(match result {
                     Ok(result) => {
                         this.error = false;
@@ -311,6 +316,7 @@ impl DistributionView {
                 this.refresh(cx);
                 this.message = saved_message;
                 this.error = saved_error;
+                this.sync_failed = sync_failed;
                 cx.notify();
             }).ok();
         }).detach();
@@ -555,18 +561,27 @@ impl Render for DistributionView {
                     .child(bufonidae_rclone::escape_control(message)),
             );
         }
-        body = body.child(
-            button("preview-sync")
-                .primary()
-                .label(if self.planning {
-                    "Planning…"
-                } else {
-                    "Preview Sync"
-                })
-                .loading(self.planning && motion::enabled(cx))
-                .disabled_feedback(busy)
-                .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
-        );
+        if self.sync_failed {
+            body = body.child(
+                button("check-after-sync")
+                    .primary()
+                    .label("Open Check")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DistributionEvent::OpenCheck))),
+            );
+        } else {
+            body = body.child(
+                button("preview-sync")
+                    .primary()
+                    .label(if self.planning {
+                        "Planning…"
+                    } else {
+                        "Preview Sync"
+                    })
+                    .loading(self.planning && motion::enabled(cx))
+                    .disabled_feedback(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
+            );
+        }
         if self.planning {
             body = body.child(motion::activity("Preparing distribution preview", cx));
         }
@@ -590,19 +605,29 @@ impl Render for DistributionView {
             let transfer_seconds = p.download_bytes as f64 / p.options.download_rate as f64
                 + p.upload_bytes as f64 / p.options.upload_rate as f64;
             body = body.child(div().text_sm().child(format!("50%-of-cap scenario: {:.2} hours. This is a speed scenario, not a measured confidence interval.",(p.seconds()+transfer_seconds)/3600.0)));
-            for warning in p.warnings.iter().take(8) {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(bufonidae_rclone::escape_control(warning)),
-                );
-            }
-            if p.warnings.len() > 8 {
-                body = body.child(format!(
-                    "{} more files have no trusted hash baseline.",
-                    p.warnings.len() - 8
-                ));
+            if p.warnings.len() <= 2 {
+                for warning in &p.warnings {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(bufonidae_rclone::escape_control(warning)),
+                    );
+                }
+            } else {
+                let first = bufonidae_rclone::escape_control(&p.warnings[0]);
+                let summary = if p.warnings.iter().all(|w| w.contains("hash")) {
+                    format!(
+                        "{} files have no trusted hash baseline (e.g. {first}).",
+                        p.warnings.len()
+                    )
+                } else {
+                    format!(
+                        "{} warnings before sync (first: {first}).",
+                        p.warnings.len()
+                    )
+                };
+                body = body.child(div().text_sm().text_color(muted).child(summary));
             }
             let changes = p.changes.clone();
             let names = p
@@ -611,76 +636,178 @@ impl Render for DistributionView {
                 .map(|q| (q.id.clone(), q.label.clone()))
                 .collect::<std::collections::BTreeMap<_, _>>();
             if !changes.is_empty() {
-                body = body.child(
-                    uniform_list(
-                        "sync-preview-files",
-                        changes.len(),
-                        cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|i| changes.get(i).map(|c| (i, c)))
-                                .map(|(i, c)| {
-                                    let labels = |ids: &[String]| {
-                                        ids.iter()
-                                            .map(|id| {
-                                                names.get(id).cloned().unwrap_or_else(|| id.clone())
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    };
-                                    div()
-                                        .h_flex()
-                                        .w_full()
-                                        .min_w(px(0.0))
-                                        .h(px(88.0))
-                                        .gap_3()
-                                        .items_center()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            div()
-                                                .v_flex()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .gap_1()
-                                                .child(div().truncate().child(
-                                                    bufonidae_rclone::escape_control(&c.path),
-                                                ))
-                                                .child(div().text_sm().truncate().child(format!(
-                                                    "{} · add [{}] · retire [{}]",
-                                                    format::bytes(c.size),
-                                                    labels(&c.add),
-                                                    labels(&c.remove)
-                                                ))),
-                                        )
-                                        .child(
-                                            button(("sync-file-detail", i))
-                                                .label("Details")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.detail = Some(i);
-                                                    cx.notify();
-                                                })),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
-                        }),
+                let total = changes.len();
+                let visible = total.min(3);
+                let scope = if total > visible {
+                    format!("Showing 1–{visible} of {total} · Scroll list to review")
+                } else {
+                    format!("Showing {total} of {total}")
+                };
+                body = body
+                    .child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(div().text_sm().font_semibold().child("Planned changes"))
+                            .child(div().text_sm().text_color(muted).child(scope)),
                     )
-                    .w_full()
-                    .h(px(264.0)),
-                );
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .px_3()
+                            .child(
+                                uniform_list(
+                                    "sync-preview-files",
+                                    changes.len(),
+                                    cx.processor(
+                                        move |_this, range: std::ops::Range<usize>, _window, cx| {
+                                            range
+                                                .filter_map(|i| changes.get(i).map(|c| (i, c)))
+                                                .map(|(i, c)| {
+                                                    let labels = |ids: &[String]| {
+                                                        ids.iter()
+                                                            .map(|id| {
+                                                                names
+                                                                    .get(id)
+                                                                    .cloned()
+                                                                    .unwrap_or_else(|| id.clone())
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    };
+                                                    div()
+                                                        .h_flex()
+                                                        .w_full()
+                                                        .min_w(px(0.0))
+                                                        .h(px(88.0))
+                                                        .gap_3()
+                                                        .items_center()
+                                                        .border_b_1()
+                                                        .border_color(cx.theme().border)
+                                                        .child(
+                                                            div()
+                                                                .v_flex()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .gap_1()
+                                                                .child(div().truncate().child(
+                                                                    bufonidae_rclone::escape_control(
+                                                                        &c.path,
+                                                                    ),
+                                                                ))
+                                                                .child(
+                                                                    div().text_sm().truncate().child(
+                                                                        format!(
+                                                                            "{} · add [{}] · retire [{}]",
+                                                                            format::bytes(c.size),
+                                                                            labels(&c.add),
+                                                                            labels(&c.remove)
+                                                                        ),
+                                                                    ),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            button(("sync-file-detail", i))
+                                                                .label("Details")
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.detail = Some(i);
+                                                                        cx.notify();
+                                                                    },
+                                                                )),
+                                                        )
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    ),
+                                )
+                                .w_full()
+                                .h(px(264.0)),
+                            ),
+                    );
             }
             if let Some(c) = self.detail.and_then(|i| p.changes.get(i)) {
+                let account_labels = |ids: &[String]| {
+                    if ids.is_empty() {
+                        return "—".to_owned();
+                    }
+                    ids.iter()
+                        .map(|id| {
+                            p.quotas
+                                .iter()
+                                .find(|quota| quota.id == *id)
+                                .map_or(id.as_str(), |quota| quota.label.as_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let detail_row = |label: &'static str, value: String| {
+                    div()
+                        .h_flex()
+                        .w_full()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .flex_none()
+                                .text_color(muted)
+                                .child(label),
+                        )
+                        .child(div().flex_1().min_w(px(0.0)).child(value))
+                };
                 body = body.child(
                     div()
                         .v_flex()
                         .w_full()
-                        .gap_1()
-                        .child(bufonidae_rclone::escape_control(&c.path))
-                        .child(format!(
-                            "Sources: {}. New accounts: {}. Retired accounts: {}.",
-                            c.sources.join(", "),
-                            c.add.join(", "),
-                            c.remove.join(", ")
-                        )),
+                        .gap_2()
+                        .p_3()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary.opacity(0.35))
+                        .child(
+                            div()
+                                .h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .font_semibold()
+                                        .truncate()
+                                        .child(bufonidae_rclone::escape_control(&c.path)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(format::bytes(c.size)),
+                                )
+                                .child(
+                                    button("close-sync-detail")
+                                        .ghost()
+                                        .compact()
+                                        .label("Close")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.detail = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(detail_row("Sources", account_labels(&c.sources)))
+                        .child(detail_row("New accounts", account_labels(&c.add)))
+                        .child(detail_row("Retired accounts", account_labels(&c.remove))),
                 );
             }
             body=body.child(checkbox("approve-sync").label("I reviewed the plan and paused external edits. Sync may retire old copies only after their replacements are read back and verified.").checked(self.approved).disabled_feedback(busy||p.changes.is_empty()).on_click(cx.listener(|this,value:&bool,_,cx|{this.approved = *value;cx.notify();})))

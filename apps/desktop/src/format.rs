@@ -80,6 +80,32 @@ pub fn utc(secs: i64) -> String {
     )
 }
 
+/// Shortens a long filename in the middle so its distinguishing ending and
+/// extension stay visible (`report-2026-11-20-final-v2.tar.gz` ->
+/// `report-2026-11…final-v2.tar.gz`).
+pub fn middle_truncate(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars || max_chars < 6 {
+        return text.to_owned();
+    }
+    let tail_len = (max_chars / 2).clamp(8, 18).min(max_chars - 3);
+    let head_len = max_chars - tail_len - 1;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(count - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
+/// Short file-type label for the library table (`"Folder"`, `"MOV"`, `"File"`).
+pub fn file_type(name: &str, is_folder: bool) -> String {
+    if is_folder {
+        return "Folder".to_owned();
+    }
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.is_empty() && ext.len() <= 8)
+        .map_or_else(|| "File".to_owned(), str::to_ascii_uppercase)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +149,18 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc(1_700_000_000), "2023-11-14 22:13 UTC");
         assert_eq!(utc(951_782_400), "2000-02-29 00:00 UTC");
+    }
+
+    #[test]
+    fn middle_truncation_keeps_ending() {
+        assert_eq!(middle_truncate("short.txt", 34), "short.txt");
+        let long = "very-long-archive-backup-2026-11-20-node-01-shard-a.tar.zst";
+        let out = middle_truncate(long, 34);
+        assert_eq!(out.chars().count(), 34);
+        assert!(out.contains('…'));
+        assert!(out.ends_with("shard-a.tar.zst"));
+        assert_eq!(file_type("Photos", true), "Folder");
+        assert_eq!(file_type("clip.mov", false), "MOV");
+        assert_eq!(file_type("README", false), "File");
     }
 }
