@@ -16,6 +16,7 @@ use gpui_component::{
 use crate::app::BufonidaeApp;
 use crate::backend::CheckOutcome;
 use crate::format;
+use crate::ui::{self, Tone};
 
 /// Lines listed per problem before "and N more".
 const LISTED: usize = 6;
@@ -40,49 +41,84 @@ fn clean(text: &str) -> String {
     bufonidae_rclone::escape_control(text)
 }
 
-/// A titled group of lines, capped.
-fn group(
-    title: String,
-    icon: IconName,
-    color: gpui::Hsla,
-    muted: gpui::Hsla,
-    lines: Vec<String>,
-    note: Option<&'static str>,
-) -> gpui::AnyElement {
-    let more = lines.len().saturating_sub(LISTED);
-    div()
-        .v_flex()
-        .gap_1p5()
-        .child(
-            div()
-                .h_flex()
-                .items_start()
-                .gap_2()
-                .text_color(color)
-                .font_medium()
-                .child(Icon::new(icon).size_4().flex_none())
-                .child(div().flex_1().child(title)),
-        )
-        .children(note.map(|n| div().pl_6().text_sm().text_color(muted).child(n)))
-        .children(lines.into_iter().take(LISTED).map(|line| {
-            div()
-                .pl_6()
-                .truncate()
-                .text_sm()
-                .text_color(muted)
-                .child(line)
-        }))
-        .children((more > 0).then(|| {
-            div()
-                .pl_6()
-                .text_sm()
-                .text_color(muted)
-                .child(format!("and {more} more"))
-        }))
-        .into_any_element()
-}
-
 impl BufonidaeApp {
+    /// A titled group of lines, capped. Clicking the title folds the lines.
+    #[allow(clippy::too_many_arguments)]
+    fn group(
+        &self,
+        cx: &mut Context<Self>,
+        title: String,
+        icon: IconName,
+        color: gpui::Hsla,
+        muted: gpui::Hsla,
+        lines: Vec<String>,
+        note: Option<&'static str>,
+    ) -> gpui::AnyElement {
+        let more = lines.len().saturating_sub(LISTED);
+        let foldable = !lines.is_empty() || note.is_some();
+        let folded = self.check_folded.contains(&title);
+        let key = title.clone();
+        let heading = div()
+            .id(gpui::SharedString::from(format!("check-group-{title}")))
+            .h_flex()
+            .items_start()
+            .gap_2()
+            .text_color(color)
+            .font_medium()
+            .child(Icon::new(icon).size_4().flex_none())
+            .child(div().flex_1().child(title))
+            .children(foldable.then(|| {
+                Icon::new(if folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size_4()
+                .flex_none()
+            }))
+            .when_foldable(
+                foldable,
+                cx.listener(move |this, _, _, cx| {
+                    if !this.check_folded.remove(&key) {
+                        this.check_folded.insert(key.clone());
+                    }
+                    cx.notify();
+                }),
+            );
+        div()
+            .v_flex()
+            .gap_1p5()
+            .child(heading)
+            .children(
+                (!folded)
+                    .then(|| note.map(|n| div().pl_6().text_sm().text_color(muted).child(n)))
+                    .flatten(),
+            )
+            .children(
+                (!folded)
+                    .then(|| {
+                        lines.into_iter().take(LISTED).map(|line| {
+                            div()
+                                .pl_6()
+                                .truncate()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(line)
+                        })
+                    })
+                    .into_iter()
+                    .flatten(),
+            )
+            .children((!folded && more > 0).then(|| {
+                div()
+                    .pl_6()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("and {more} more"))
+            }))
+            .into_any_element()
+    }
+
     pub(crate) fn check_screen(
         &mut self,
         _window: &mut Window,
@@ -100,6 +136,7 @@ impl BufonidaeApp {
 
         let header = div()
             .h_flex()
+            .w_full()
             .items_start()
             .justify_between()
             .gap_4()
@@ -109,6 +146,8 @@ impl BufonidaeApp {
             .child(
                 div()
                     .v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
                     .gap_1()
                     .child(div().text_2xl().font_semibold().child("Check files"))
                     .child(div().text_color(muted).child(
@@ -117,6 +156,7 @@ impl BufonidaeApp {
             )
             .child(
                 button("check-now")
+                    .flex_none()
                     .primary()
                     .icon(IconName::CircleCheck)
                     .label("Check now")
@@ -140,22 +180,55 @@ impl BufonidaeApp {
                 .child(crate::motion::activity(if self.verification_stopping { "Cancelling verification — waiting for it to stop" } else { what }, cx))
                 .into_any_element(),
             CheckState::Failed(message) => div()
-                .h_flex()
-                .items_start()
-                .gap_2()
                 .p_6()
-                .text_color(danger)
-                .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
-                .child(div().flex_1().child(message.clone()))
+                .child(ui::notice(Tone::Danger, message.clone(), None, cx))
                 .into_any_element(),
             CheckState::VerificationCancelled => div().p_6().child("Content verification cancelled. No remote files or trusted hashes were changed.").into_any_element(),
-            CheckState::Verified(report) => div().v_flex().p_6().gap_4()
-                .child(format!("{} copies verified · {} · {} without a hash reference · {} failures", report.verified, format::bytes(report.bytes), report.without_hash.len(), report.failed.len()))
-                .child(group("Copies that could not be verified".into(), IconName::TriangleAlert, danger, muted,
-                    report.failed.iter().map(|(path, account, reason)| format!("{} · {}: {}", clean(path), clean(account), clean(reason))).collect(), None))
-                .child(group("Files without a trusted hash".into(), IconName::Info, muted, muted,
-                    report.without_hash.iter().map(|path| clean(path)).collect(), Some("Matching size alone does not establish content integrity.")))
-                .into_any_element(),
+            CheckState::Verified(report) => {
+                let tile = |icon: IconName, tone: Tone, count: usize, label: &'static str, cx: &mut Context<Self>| {
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_w(px(140.0))
+                        .gap_1()
+                        .p_4()
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(border)
+                        .bg(surface)
+                        .child(
+                            div()
+                                .h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Icon::new(icon).size_4().text_color(tone.accent(cx)))
+                                .child(div().text_2xl().font_semibold().child(count.to_string())),
+                        )
+                        .child(div().text_sm().text_color(muted).child(label))
+                        .into_any_element()
+                };
+                let tiles = div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .child(tile(IconName::CircleCheck, Tone::Success, report.verified, "copies verified", cx))
+                    .child(tile(IconName::Info, Tone::Neutral, report.without_hash.len(), "without a hash reference", cx))
+                    .child(tile(IconName::CircleX, Tone::Danger, report.failed.len(), "failures", cx));
+                let groups = vec![
+                    self.group(cx, "Copies that could not be verified".into(), IconName::TriangleAlert, danger, muted,
+                        report.failed.iter().map(|(path, account, reason)| format!("{} · {}: {}", clean(path), clean(account), clean(reason))).collect(), None),
+                    self.group(cx, "Files without a trusted hash".into(), IconName::Info, muted, muted,
+                        report.without_hash.iter().map(|path| clean(path)).collect(), Some("Matching size alone does not establish content integrity.")),
+                ];
+                div()
+                    .v_flex()
+                    .p_6()
+                    .gap_4()
+                    .child(tiles)
+                    .child(div().text_sm().text_color(muted).child(format!("{} verified in total.", format::bytes(report.bytes))))
+                    .children(self.stagger(groups, cx))
+                    .into_any_element()
+            }
             CheckState::Result {
                 outcome,
                 applied,
@@ -169,7 +242,7 @@ impl BufonidaeApp {
                 let mut sections: Vec<gpui::AnyElement> = Vec::new();
 
                 if let Some(done) = repaired {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} rebuilt", plural_copies(done.repaired.len())),
                         IconName::CircleCheck,
                         success,
@@ -181,7 +254,7 @@ impl BufonidaeApp {
                         None,
                     ));
                     for (path, reason) in &done.failed {
-                        sections.push(group(
+                        sections.push(self.group(cx,
                             format!("Could not rebuild {}", clean(path)),
                             IconName::CircleX,
                             danger,
@@ -192,7 +265,7 @@ impl BufonidaeApp {
                     }
                 }
                 if all_good {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("Everything matches ({} checked)", format::files(r.consistent)),
                         IconName::CircleCheck,
                         success,
@@ -215,7 +288,7 @@ impl BufonidaeApp {
                     for (p, a, size) in &r.imported {
                         lines.push(format!("{} {} ({}, {})", verb("Added", "Would add"), clean(p), clean(a), format::bytes(*size)));
                     }
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         if *applied {
                             format!("{} fixed in the index", r.fixable())
                         } else {
@@ -229,7 +302,7 @@ impl BufonidaeApp {
                     ));
                 }
                 for (path, a, want, got) in &r.size_mismatch {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} ({}) has a different size", clean(path), clean(a)),
                         IconName::TriangleAlert,
                         danger,
@@ -239,7 +312,7 @@ impl BufonidaeApp {
                     ));
                 }
                 if !r.partial.is_empty() {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} look partly uploaded", format::files(r.partial.len())),
                         IconName::TriangleAlert,
                         danger,
@@ -249,7 +322,7 @@ impl BufonidaeApp {
                     ));
                 }
                 if !r.conflicts.is_empty() {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} disagree between accounts", format::files(r.conflicts.len())),
                         IconName::TriangleAlert,
                         danger,
@@ -259,7 +332,7 @@ impl BufonidaeApp {
                     ));
                 }
                 if !r.duplicates.is_empty() {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} exist twice in one account", format::files(r.duplicates.len())),
                         IconName::TriangleAlert,
                         danger,
@@ -269,7 +342,7 @@ impl BufonidaeApp {
                     ));
                 }
                 for (label, why) in &r.unreachable {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("Account {} was not used", clean(label)),
                         IconName::TriangleAlert,
                         danger,
@@ -279,7 +352,7 @@ impl BufonidaeApp {
                     ));
                 }
                 if !lost.is_empty() {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} lost", format::files(lost.len())),
                         IconName::CircleX,
                         danger,
@@ -289,7 +362,7 @@ impl BufonidaeApp {
                     ));
                 }
                 if !under.is_empty() {
-                    sections.push(group(
+                    sections.push(self.group(cx,
                         format!("{} with fewer copies than wanted", format::files(under.len())),
                         IconName::TriangleAlert,
                         danger,
@@ -333,7 +406,7 @@ impl BufonidaeApp {
                             .bg(surface)
                             .border_1()
                             .border_color(border)
-                            .children(sections),
+                            .children(self.stagger(sections, cx)),
                     )
                     .children(has_actions.then_some(actions))
                     .into_any_element()
@@ -348,7 +421,7 @@ impl BufonidaeApp {
             .child({
                 let bytes = self.snapshot().map(|s| s.files.iter().filter(|f| f.blake3.is_some()).fold(0u64, |total, file| total.saturating_add(file.size.saturating_mul(file.accounts.len() as u64)))).unwrap_or(0);
                 div().h_flex().flex_wrap().gap_3().px_6().py_3()
-                    .child(div().text_sm().text_color(muted).child(format!("Deep check downloads up to {} of indexed copies. Files without a hash are reported separately.", format::bytes(bytes))))
+                    .child(div().w_full().min_w(px(0.0)).text_sm().text_color(muted).child(format!("Deep check downloads up to {} of indexed copies. Files without a hash are reported separately.", format::bytes(bytes))))
                     .child(button("deep-check").label("Download and verify contents").disabled_feedback(running)
                         .on_click(cx.listener(|this, _, _, cx| this.run_deep_check(cx))))
                     .children((self.verification_cancel.is_some() || self.verification_stopping).then(|| button("cancel-verification").label(if self.verification_stopping { "Cancelling…" } else { "Cancel verification" }).disabled_feedback(self.verification_stopping)
@@ -366,4 +439,48 @@ impl BufonidaeApp {
 
 fn plural_copies(n: usize) -> String {
     format!("{n} cop{}", if n == 1 { "y" } else { "ies" })
+}
+
+impl BufonidaeApp {
+    /// Groups appear one after another the first time a screen is shown;
+    /// reduced motion shows them at once.
+    fn stagger(&self, groups: Vec<gpui::AnyElement>, cx: &gpui::App) -> Vec<gpui::AnyElement> {
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(i, group)| {
+                crate::motion::stagger(
+                    group,
+                    gpui::SharedString::from(format!(
+                        "check-group-{}-{i}",
+                        self.screen_generation()
+                    )),
+                    i,
+                    cx,
+                )
+            })
+            .collect()
+    }
+}
+
+trait WhenFoldable: Sized {
+    fn when_foldable(
+        self,
+        foldable: bool,
+        handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> Self;
+}
+
+impl WhenFoldable for gpui::Stateful<gpui::Div> {
+    fn when_foldable(
+        self,
+        foldable: bool,
+        handler: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    ) -> Self {
+        if foldable {
+            self.cursor_pointer().on_click(handler)
+        } else {
+            self
+        }
+    }
 }

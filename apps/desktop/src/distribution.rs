@@ -12,7 +12,7 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, Selectable as _, StyledExt as _,
+    ActiveTheme as _, Icon, IconName, Selectable as _, StyledExt as _,
     button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
     progress::Progress as Bar,
@@ -29,6 +29,7 @@ use std::{
 pub enum DistributionEvent {
     Started,
     Finished,
+    OpenCheck,
     Health(Vec<AccountHealth>),
 }
 impl EventEmitter<DistributionEvent> for DistributionView {}
@@ -46,6 +47,7 @@ pub struct DistributionView {
     approved: bool,
     message: Option<String>,
     error: bool,
+    sync_failed: bool,
     cancel: Option<Arc<AtomicBool>>,
     progress: Option<Progress>,
     live: Option<bufonidae_rclone::rcd::TransferStats>,
@@ -108,6 +110,7 @@ impl DistributionView {
             approved: false,
             message: None,
             error: false,
+            sync_failed: false,
             cancel: None,
             progress: None,
             live: None,
@@ -128,6 +131,7 @@ impl DistributionView {
             self.approved = false;
             self.detail = None;
             self.message = None;
+            self.sync_failed = false;
         }
     }
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -295,6 +299,7 @@ impl DistributionView {
                 this.cancel = None;
                 this.preview = None;
                 this.approved = false;
+                let sync_failed = result.is_err();
                 this.message = Some(match result {
                     Ok(result) => {
                         this.error = false;
@@ -311,6 +316,7 @@ impl DistributionView {
                 this.refresh(cx);
                 this.message = saved_message;
                 this.error = saved_error;
+                this.sync_failed = sync_failed;
                 cx.notify();
             }).ok();
         }).detach();
@@ -396,12 +402,23 @@ impl Render for DistributionView {
                             ),
                         );
                 } else {
-                    row = row.child(div().text_sm().text_color(cx.theme().danger).child(
-                        match health.map(|h| &h.status) {
-                            Some(HealthStatus::Unreachable(why)) => format!("Unavailable: {why}"),
-                            _ => "Quota not reported. Sync requires known quotas.".into(),
-                        },
-                    ));
+                    row = row.child(
+                        div()
+                            .h_flex()
+                            .items_start()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(Icon::new(IconName::TriangleAlert).size_4().flex_none())
+                            .child(div().flex_1().min_w(px(0.0)).child(
+                                match health.map(|h| &h.status) {
+                                    Some(HealthStatus::Unreachable(why)) => {
+                                        format!("Unavailable: {why}")
+                                    }
+                                    _ => "Quota not reported. Sync requires known quotas.".into(),
+                                },
+                            )),
+                    );
                 }
                 if let Some(projected) = self
                     .preview
@@ -460,58 +477,111 @@ impl Render for DistributionView {
             ),
         ] {
             let selected = std::mem::discriminant(&self.mode) == std::mem::discriminant(&mode);
-            modes = modes.child(
-                button(id)
-                    .label(label)
-                    .selected(selected)
-                    .disabled_feedback(busy)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mode = mode.clone();
-                        if matches!(this.mode, Mode::Evacuate(_)) {
-                            this.mode = Mode::Evacuate(
-                                this.snapshot
-                                    .as_ref()
-                                    .and_then(|s| s.accounts.first())
-                                    .map(|a| a.id.clone())
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        this.invalidate();
-                        cx.notify();
-                    })),
-            );
+            let mode_button = button(id)
+                .label(label)
+                .selected(selected)
+                .disabled_feedback(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mode = mode.clone();
+                    if matches!(this.mode, Mode::Evacuate(_)) {
+                        this.mode = Mode::Evacuate(
+                            this.snapshot
+                                .as_ref()
+                                .and_then(|s| s.accounts.first())
+                                .map(|a| a.id.clone())
+                                .unwrap_or_default(),
+                        );
+                    }
+                    this.invalidate();
+                    cx.notify();
+                }));
+            modes = modes.child(if selected {
+                mode_button.primary()
+            } else {
+                mode_button
+            });
         }
-        body=body.child(modes).child(div().text_sm().text_color(muted).child("Balance equalizes percentage used, preserving unmanaged data and existing copy counts. Repair only adds missing policy copies. Mirror creates 2–8 distinct-account copies. Evacuate moves indexed copies off one account. Current policy and existing copy counts are never reduced. These are whole-file strategies; RAID 0 striping and RAID 5/6 parity are not supported. Future uploads retain the policy in Settings."));
+        let strategy_hint = match self.mode {
+            Mode::Balance => "Even out account usage while keeping existing copies.",
+            Mode::Repair => "Add missing copies to match your policy.",
+            Mode::Mirror(_) => "Keep 2–8 copies on separate accounts.",
+            Mode::Evacuate(_) => "Move indexed copies off the selected account.",
+        };
+        body = body
+            .child(modes)
+            .child(div().text_sm().text_color(muted).child(strategy_hint));
         if matches!(self.mode, Mode::Evacuate(_)) {
             let mut targets = div().h_flex().flex_wrap().gap_2();
             if let Some(snapshot) = &self.snapshot {
                 for (i, account) in snapshot.accounts.iter().enumerate() {
                     let id = account.id.clone();
-                    targets = targets.child(
-                        button(("evacuate-account", i))
-                            .label(format!("Evacuate {}", account.label))
-                            .selected(
-                                matches!(&self.mode,Mode::Evacuate(selected) if selected==&id),
-                            )
-                            .disabled_feedback(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode = Mode::Evacuate(id.clone());
-                                this.invalidate();
-                                cx.notify();
-                            })),
-                    );
+                    let chosen = matches!(&self.mode, Mode::Evacuate(selected) if selected == &id);
+                    let target_button = button(("evacuate-account", i))
+                        .label(format!("Evacuate {}", account.label))
+                        .selected(chosen)
+                        .disabled_feedback(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mode = Mode::Evacuate(id.clone());
+                            this.invalidate();
+                            cx.notify();
+                        }));
+                    targets = targets.child(if chosen {
+                        target_button.primary()
+                    } else {
+                        target_button
+                    });
                 }
             }
             body=body.child(targets).child(div().text_sm().child("Only indexed files move. Other remote data stays on the evacuated account; it remains connected."));
         }
-        let mut fields = div().h_flex().flex_wrap().gap_4();
+        let mut fields = div().h_flex().flex_wrap().items_end().gap_4();
         for i in 0..8 {
             if i != 6 || matches!(self.mode, Mode::Mirror(_)) {
                 fields = fields.child(self.field(i));
             }
         }
-        body=body.child(fields).child(div().text_sm().text_color(muted).child("Rates are editable assumptions and actual rclone caps, not measured internet speeds (Mbps = megabits/s). Transfers are sequential: source download → upload → destination readback; retiring a copy also re-downloads that original before deletion. Quota reset delay waits before transfer. The preview budget is a planning ceiling; retries/fallback reads may consume more. Provider bandwidth quota/reset is unknown. Stop external remote edits while Sync runs."))
-            .child(button("preview-sync").primary().label(if self.planning{"Planning…"}else{"Preview Sync"}).loading(self.planning&&motion::enabled(cx)).disabled_feedback(busy).on_click(cx.listener(|this,_,_,cx|this.preview(cx))));
+        body = body.child(fields).child(
+            div()
+                .v_flex()
+                .gap_1()
+                .text_sm()
+                .text_color(muted)
+                .child("Caps limit rclone speeds. The preview uses your quota delay and download budget.")
+                .child("Sync verifies replacement copies before removing originals.")
+                .child("Avoid changing remote files while Sync runs."),
+        );
+        if let Some(message) = &self.message {
+            body = body.child(
+                div()
+                    .text_color(if self.error {
+                        cx.theme().danger
+                    } else {
+                        cx.theme().foreground
+                    })
+                    .child(bufonidae_rclone::escape_control(message)),
+            );
+        }
+        if self.sync_failed {
+            body = body.child(
+                button("check-after-sync")
+                    .primary()
+                    .label("Open Check")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DistributionEvent::OpenCheck))),
+            );
+        } else {
+            body = body.child(
+                button("preview-sync")
+                    .primary()
+                    .label(if self.planning {
+                        "Planning…"
+                    } else {
+                        "Preview Sync"
+                    })
+                    .loading(self.planning && motion::enabled(cx))
+                    .disabled_feedback(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
+            );
+        }
         if self.planning {
             body = body.child(motion::activity("Preparing distribution preview", cx));
         }
@@ -531,23 +601,33 @@ impl Render for DistributionView {
                 .child(format!("{} file changes · {:.2} hours at configured caps, latency and quota delay",p.changes.len(),p.seconds()/3600.0))
                 .child(format!("Download {} = {} source + {} destination readback + {} original rechecks. Upload {}.",format::bytes(p.download_bytes),format::bytes(source_download),format::bytes(readback),format::bytes(recheck),format::bytes(p.upload_bytes)))
                 .child(format!("Peak local staging: {} + 64 MiB reserve · {} available in {}",format::bytes(p.temporary_bytes),format::bytes(preview.local_free),preview.staging.display()))
-                .child(div().text_sm().text_color(muted).child("Time = download bytes / download cap + upload bytes / upload cap + estimated operation setup latency + entered quota delay. Hashing, disk I/O, authentication, retries, provider throttling and unknown reset waits can extend it; this is not a guaranteed completion time."));
+                .child(div().text_sm().text_color(muted).child("Estimate uses transfer caps, setup time and quota delay. Retries and throttling can extend it."));
             let transfer_seconds = p.download_bytes as f64 / p.options.download_rate as f64
                 + p.upload_bytes as f64 / p.options.upload_rate as f64;
             body = body.child(div().text_sm().child(format!("50%-of-cap scenario: {:.2} hours. This is a speed scenario, not a measured confidence interval.",(p.seconds()+transfer_seconds)/3600.0)));
-            for warning in p.warnings.iter().take(8) {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(bufonidae_rclone::escape_control(warning)),
-                );
-            }
-            if p.warnings.len() > 8 {
-                body = body.child(format!(
-                    "{} more files have no trusted hash baseline.",
-                    p.warnings.len() - 8
-                ));
+            if p.warnings.len() <= 2 {
+                for warning in &p.warnings {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(bufonidae_rclone::escape_control(warning)),
+                    );
+                }
+            } else {
+                let first = bufonidae_rclone::escape_control(&p.warnings[0]);
+                let summary = if p.warnings.iter().all(|w| w.contains("hash")) {
+                    format!(
+                        "{} files have no trusted hash baseline (e.g. {first}).",
+                        p.warnings.len()
+                    )
+                } else {
+                    format!(
+                        "{} warnings before sync (first: {first}).",
+                        p.warnings.len()
+                    )
+                };
+                body = body.child(div().text_sm().text_color(muted).child(summary));
             }
             let changes = p.changes.clone();
             let names = p
@@ -556,76 +636,178 @@ impl Render for DistributionView {
                 .map(|q| (q.id.clone(), q.label.clone()))
                 .collect::<std::collections::BTreeMap<_, _>>();
             if !changes.is_empty() {
-                body = body.child(
-                    uniform_list(
-                        "sync-preview-files",
-                        changes.len(),
-                        cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
-                            range
-                                .filter_map(|i| changes.get(i).map(|c| (i, c)))
-                                .map(|(i, c)| {
-                                    let labels = |ids: &[String]| {
-                                        ids.iter()
-                                            .map(|id| {
-                                                names.get(id).cloned().unwrap_or_else(|| id.clone())
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    };
-                                    div()
-                                        .h_flex()
-                                        .w_full()
-                                        .min_w(px(0.0))
-                                        .h(px(88.0))
-                                        .gap_3()
-                                        .items_center()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            div()
-                                                .v_flex()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .gap_1()
-                                                .child(div().truncate().child(
-                                                    bufonidae_rclone::escape_control(&c.path),
-                                                ))
-                                                .child(div().text_sm().truncate().child(format!(
-                                                    "{} · add [{}] · retire [{}]",
-                                                    format::bytes(c.size),
-                                                    labels(&c.add),
-                                                    labels(&c.remove)
-                                                ))),
-                                        )
-                                        .child(
-                                            button(("sync-file-detail", i))
-                                                .label("Details")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.detail = Some(i);
-                                                    cx.notify();
-                                                })),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
-                        }),
+                let total = changes.len();
+                let visible = total.min(3);
+                let scope = if total > visible {
+                    format!("Showing 1–{visible} of {total} · Scroll list to review")
+                } else {
+                    format!("Showing {total} of {total}")
+                };
+                body = body
+                    .child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(div().text_sm().font_semibold().child("Planned changes"))
+                            .child(div().text_sm().text_color(muted).child(scope)),
                     )
-                    .w_full()
-                    .h(px(264.0)),
-                );
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .px_3()
+                            .child(
+                                uniform_list(
+                                    "sync-preview-files",
+                                    changes.len(),
+                                    cx.processor(
+                                        move |_this, range: std::ops::Range<usize>, _window, cx| {
+                                            range
+                                                .filter_map(|i| changes.get(i).map(|c| (i, c)))
+                                                .map(|(i, c)| {
+                                                    let labels = |ids: &[String]| {
+                                                        ids.iter()
+                                                            .map(|id| {
+                                                                names
+                                                                    .get(id)
+                                                                    .cloned()
+                                                                    .unwrap_or_else(|| id.clone())
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    };
+                                                    div()
+                                                        .h_flex()
+                                                        .w_full()
+                                                        .min_w(px(0.0))
+                                                        .h(px(88.0))
+                                                        .gap_3()
+                                                        .items_center()
+                                                        .border_b_1()
+                                                        .border_color(cx.theme().border)
+                                                        .child(
+                                                            div()
+                                                                .v_flex()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .gap_1()
+                                                                .child(div().truncate().child(
+                                                                    bufonidae_rclone::escape_control(
+                                                                        &c.path,
+                                                                    ),
+                                                                ))
+                                                                .child(
+                                                                    div().text_sm().truncate().child(
+                                                                        format!(
+                                                                            "{} · add [{}] · retire [{}]",
+                                                                            format::bytes(c.size),
+                                                                            labels(&c.add),
+                                                                            labels(&c.remove)
+                                                                        ),
+                                                                    ),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            button(("sync-file-detail", i))
+                                                                .label("Details")
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.detail = Some(i);
+                                                                        cx.notify();
+                                                                    },
+                                                                )),
+                                                        )
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    ),
+                                )
+                                .w_full()
+                                .h(px(264.0)),
+                            ),
+                    );
             }
             if let Some(c) = self.detail.and_then(|i| p.changes.get(i)) {
+                let account_labels = |ids: &[String]| {
+                    if ids.is_empty() {
+                        return "—".to_owned();
+                    }
+                    ids.iter()
+                        .map(|id| {
+                            p.quotas
+                                .iter()
+                                .find(|quota| quota.id == *id)
+                                .map_or(id.as_str(), |quota| quota.label.as_str())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let detail_row = |label: &'static str, value: String| {
+                    div()
+                        .h_flex()
+                        .w_full()
+                        .gap_3()
+                        .text_sm()
+                        .child(
+                            div()
+                                .w(px(120.0))
+                                .flex_none()
+                                .text_color(muted)
+                                .child(label),
+                        )
+                        .child(div().flex_1().min_w(px(0.0)).child(value))
+                };
                 body = body.child(
                     div()
                         .v_flex()
                         .w_full()
-                        .gap_1()
-                        .child(bufonidae_rclone::escape_control(&c.path))
-                        .child(format!(
-                            "Sources: {}. New accounts: {}. Retired accounts: {}.",
-                            c.sources.join(", "),
-                            c.add.join(", "),
-                            c.remove.join(", ")
-                        )),
+                        .gap_2()
+                        .p_3()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary.opacity(0.35))
+                        .child(
+                            div()
+                                .h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .font_semibold()
+                                        .truncate()
+                                        .child(bufonidae_rclone::escape_control(&c.path)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(format::bytes(c.size)),
+                                )
+                                .child(
+                                    button("close-sync-detail")
+                                        .ghost()
+                                        .compact()
+                                        .label("Close")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.detail = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(detail_row("Sources", account_labels(&c.sources)))
+                        .child(detail_row("New accounts", account_labels(&c.add)))
+                        .child(detail_row("Retired accounts", account_labels(&c.remove))),
                 );
             }
             body=body.child(checkbox("approve-sync").label("I reviewed the plan and paused external edits. Sync may retire old copies only after their replacements are read back and verified.").checked(self.approved).disabled_feedback(busy||p.changes.is_empty()).on_click(cx.listener(|this,value:&bool,_,cx|{this.approved = *value;cx.notify();})))
@@ -672,17 +854,6 @@ impl Render for DistributionView {
             }
             body=body.child(button("stop-sync").label("Stop after current file").disabled_feedback(stopping).on_click(cx.listener(|this,_,_,cx|{if let Some(cancel)=&this.cancel{cancel.store(true,Ordering::Relaxed);}cx.notify();})))
                 .child(div().text_sm().child("Stopping waits for the current file's copy/verify/commit sequence; a large file can take hours. Completed files remain saved. Keep this app open. Failures and interrupted runs are recorded in Transfers; use Check before a new preview."));
-        }
-        if let Some(message) = &self.message {
-            body = body.child(
-                div()
-                    .text_color(if self.error {
-                        cx.theme().danger
-                    } else {
-                        cx.theme().foreground
-                    })
-                    .child(bufonidae_rclone::escape_control(message)),
-            );
         }
         div()
             .id("storage-distribution")

@@ -312,12 +312,13 @@ impl StoreForm {
     fn message_line(icon: IconName, text: String, color: gpui::Hsla) -> impl IntoElement {
         div()
             .h_flex()
+            .w_full()
             .items_start()
             .gap_2()
             .text_sm()
             .text_color(color)
             .child(Icon::new(icon).size_4().flex_none())
-            .child(div().flex_1().child(text))
+            .child(div().flex_1().min_w(px(0.0)).child(text))
     }
 
     fn summary_of_paths(&self) -> String {
@@ -343,26 +344,8 @@ impl Render for StoreForm {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, success, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.success,
-            theme.border,
-            theme.popover,
-        );
-        let card = || {
-            div()
-                .v_flex()
-                .w(px(480.0))
-                .max_w(window.viewport_size().width - px(32.0))
-                .gap_4()
-                .p_6()
-                .rounded(px(14.0))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .shadow_lg()
-        };
+        let (muted, danger, success) = (theme.muted_foreground, theme.danger, theme.success);
+        let card = || crate::ui::Dialog::new(480.0, window, cx);
         let title = |text: &str| div().text_xl().font_semibold().child(text.to_owned());
 
         let content = match &self.phase {
@@ -382,8 +365,8 @@ impl Render for StoreForm {
                     message.clone(),
                     danger,
                 ))
-                .child(
-                    div().h_flex().justify_end().child(
+                .footer(
+ div().h_flex().justify_end().child(
                         button("close")
                             .primary()
                             .label("Close")
@@ -440,8 +423,8 @@ impl Render for StoreForm {
                     "Cancel stops the transfer in progress. Copies already stored stay \
                          stored.",
                 ))
-                .child(
-                    div().h_flex().justify_end().child(
+                .footer(
+ div().h_flex().justify_end().child(
                         button("stop")
                             .label(if c.cancelling {
                                 "Stopping…"
@@ -476,8 +459,8 @@ impl Render for StoreForm {
                             muted,
                         )),
                 )
-                .child(
-                    div().h_flex().justify_end().child(
+                .footer(
+ div().h_flex().justify_end().child(
                         button("done")
                             .primary()
                             .label("Done")
@@ -564,8 +547,8 @@ impl Render for StoreForm {
                         "Stored with problems"
                     }))
                     .child(div().v_flex().gap_2().children(lines))
-                    .child(
-                        div().h_flex().justify_end().child(
+                    .footer(
+ div().h_flex().justify_end().child(
                             button("done")
                                 .primary()
                                 .label("Done")
@@ -708,25 +691,28 @@ impl Render for StoreForm {
                         config::describe(copies),
                     )))
                     .children(notes)
-                    .child(
-                        div()
-                            .h_flex()
-                            .justify_end()
+                    .footer(
+ div().h_flex().justify_end()
                             .gap_2()
                             .child(
                                 button("cancel")
                                     .label("Cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                             )
-                            .child(
-                                button("store")
-                                    .primary()
+                            .child({
+                                let store = button("store")
                                     .label("Store")
                                     .disabled_feedback(!can_start)
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.start(window, cx)),
-                                    ),
-                            ),
+                                    );
+                                // Past the size limit, the action itself carries the warning.
+                                if self.needs_confirmation() {
+                                    store.danger()
+                                } else {
+                                    store.primary()
+                                }
+                            }),
                     )
                     .into_any_element()
             }

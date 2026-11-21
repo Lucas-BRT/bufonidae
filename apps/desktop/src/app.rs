@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, ExternalPaths, FocusHandle,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, PathPromptOptions,
-    Render, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Render, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Selectable as _, StyledExt as _,
@@ -81,6 +81,15 @@ pub struct BufonidaeApp {
     pub(crate) file_sort: bufonidae_core::config::FileSort,
     pub(crate) file_filter: bufonidae_core::config::FileFilter,
     pub(crate) selected_files: std::collections::BTreeSet<String>,
+    /// Keyboard focus for the Files list, its highlighted row and scroll position.
+    pub(crate) root_focus: FocusHandle,
+    pub(crate) files_focus: FocusHandle,
+    pub(crate) active_row: Option<usize>,
+    pub(crate) files_scroll: gpui::UniformListScrollHandle,
+    /// Whether the selection bar was showing at the last render; its fade-in
+    /// replays only when the selection goes from empty to non-empty.
+    pub(crate) selection_bar_visible: bool,
+    pub(crate) selection_bar_generation: usize,
     /// The folder open on the Files screen (`""` is the top level).
     pub(crate) folder: String,
     data: Data,
@@ -102,7 +111,18 @@ pub struct BufonidaeApp {
     pub(crate) verification_stopping: bool,
     pub(crate) transfers_refreshing: bool,
     pub(crate) transfer_details: Option<String>,
+    /// Check result groups the user folded away, by title.
+    pub(crate) check_folded: std::collections::BTreeSet<String>,
+    /// Focus lands in the open details panel; Escape returns it to the window.
+    pub(crate) transfer_panel_focus: FocusHandle,
     pub(crate) verification_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Paths that arrived with the last reload, highlighted for a moment.
+    pub(crate) fresh: std::collections::BTreeSet<String>,
+    fresh_generation: usize,
+    /// The sidebar storage meter eases between these when a check finishes.
+    storage_from: f32,
+    storage_to: f32,
+    storage_revision: usize,
 }
 
 impl BufonidaeApp {
@@ -132,6 +152,12 @@ impl BufonidaeApp {
             file_sort: options.sort,
             file_filter: options.filter,
             selected_files: std::collections::BTreeSet::new(),
+            root_focus: cx.focus_handle(),
+            files_focus: cx.focus_handle().tab_stop(true),
+            active_row: None,
+            files_scroll: gpui::UniformListScrollHandle::new(),
+            selection_bar_visible: false,
+            selection_bar_generation: 0,
             folder: String::new(),
             data: Data::Loading,
             modal: None,
@@ -149,9 +175,16 @@ impl BufonidaeApp {
             transfer_error: None,
             transfer_refresh_error: None,
             verification_cancel: None,
+            fresh: std::collections::BTreeSet::new(),
+            fresh_generation: 0,
+            storage_from: 0.0,
+            storage_to: 0.0,
+            storage_revision: 0,
             verification_stopping: false,
             transfers_refreshing: false,
             transfer_details: None,
+            check_folded: std::collections::BTreeSet::new(),
+            transfer_panel_focus: cx.focus_handle().tab_stop(true),
         };
         if let Ok(backend) = &app.backend {
             let backend = Arc::clone(backend);
@@ -159,14 +192,18 @@ impl BufonidaeApp {
                 crate::distribution::DistributionView::new(Arc::clone(&backend), window, cx)
             }));
             if let Some(view) = &app.distribution {
-                cx.subscribe(
+                cx.subscribe_in(
                     view,
-                    |this, _, event: &crate::distribution::DistributionEvent, cx| {
+                    window,
+                    |this, _, event: &crate::distribution::DistributionEvent, window, cx| {
                         match event {
                             crate::distribution::DistributionEvent::Started => {
                                 this.refresh_transfers(cx)
                             }
                             crate::distribution::DistributionEvent::Finished => this.reload(cx),
+                            crate::distribution::DistributionEvent::OpenCheck => {
+                                this.execute_command(Command::Check, window, cx);
+                            }
                             crate::distribution::DistributionEvent::Health(health) => {
                                 this.health = Health::Ready(health.clone())
                             }
@@ -232,6 +269,7 @@ impl BufonidaeApp {
         })
         .detach();
         app.reload(cx);
+        window.focus(&app.root_focus);
         cx.spawn(async move |this, cx| {
             loop {
                 gpui::Timer::after(std::time::Duration::from_secs(2)).await;
@@ -260,7 +298,12 @@ impl BufonidaeApp {
         app
     }
 
-    fn execute_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn execute_command(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = match command {
             Command::Files | Command::Search => Some(Screen::Files),
             Command::Accounts => Some(Screen::Accounts),
@@ -275,6 +318,9 @@ impl BufonidaeApp {
                 self.screen_generation += 1;
             }
             self.screen = target;
+            if !matches!(command, Command::Search) {
+                window.focus(&self.root_focus);
+            }
         }
         match command {
             Command::Search => self.search.update(cx, |field, cx| field.focus(window, cx)),
@@ -352,6 +398,8 @@ impl BufonidaeApp {
         if self.presented_modal.is_none() {
             if let Some(focus) = self.return_focus.take() {
                 window.focus(&focus);
+            } else if window.focused(cx).is_none() {
+                window.focus(&self.root_focus);
             }
             return;
         }
@@ -477,10 +525,17 @@ impl BufonidaeApp {
                 Err(join_error) => Err(join_error.to_string()),
             };
             this.update(cx, |this, cx| {
+                let visible = this.storage_to;
                 this.health = match result {
                     Ok(all) => Health::Ready(all),
                     Err(message) => Health::Failed(message),
                 };
+                let reached = this.storage_percent();
+                if (reached - visible).abs() > f32::EPSILON {
+                    this.storage_from = visible;
+                    this.storage_to = reached;
+                    this.storage_revision += 1;
+                }
                 cx.notify();
             })
             .ok();
@@ -699,6 +754,7 @@ impl BufonidaeApp {
     /// Shows `folder` on the Files screen.
     pub(crate) fn open_folder(&mut self, folder: String, cx: &mut Context<Self>) {
         self.folder = folder;
+        self.active_row = None;
         cx.notify();
     }
 
@@ -849,6 +905,60 @@ impl BufonidaeApp {
         }).detach();
     }
 
+    /// Marks what a reload added, and eases the sidebar size to its new value.
+    /// The first load has nothing to compare with, so it stays still.
+    fn note_changes(
+        &mut self,
+        before: Option<std::collections::BTreeSet<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.snapshot() else {
+            return;
+        };
+        let fresh: std::collections::BTreeSet<String> = before
+            .map(|old| {
+                snapshot
+                    .files
+                    .iter()
+                    .filter(|f| !old.contains(&f.path))
+                    // A bulk import is not worth highlighting row by row.
+                    .take(50)
+                    .map(|f| f.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if fresh.is_empty() {
+            return;
+        }
+        let hold = if motion::enabled(cx) {
+            motion::FLASH
+        } else {
+            motion::NEW_CHIP
+        };
+        self.fresh = fresh;
+        self.fresh_generation += 1;
+        let generation = self.fresh_generation;
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(hold).await;
+            this.update(cx, |this, cx| {
+                if this.fresh_generation == generation {
+                    this.fresh.clear();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn screen_generation(&self) -> usize {
+        self.screen_generation
+    }
+
+    pub(crate) fn fresh_generation(&self) -> usize {
+        self.fresh_generation
+    }
+
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         let Ok(backend) = &self.backend else {
             return;
@@ -860,6 +970,9 @@ impl BufonidaeApp {
                 Err(join_error) => Err(join_error.to_string()),
             };
             this.update(cx, |this, cx| {
+                let before: Option<std::collections::BTreeSet<String>> = this
+                    .snapshot()
+                    .map(|s| s.files.iter().map(|f| f.path.clone()).collect());
                 this.data = match result {
                     Ok(snapshot) => {
                         this.selected_files.retain(|path| {
@@ -875,6 +988,7 @@ impl BufonidaeApp {
                     }
                     Err(message) => Data::Failed(message),
                 };
+                this.note_changes(before, cx);
                 let needs_storage = this.snapshot().is_some_and(|snapshot| {
                     !snapshot.accounts.is_empty()
                         && match &this.health {
@@ -899,45 +1013,170 @@ impl BufonidaeApp {
         .detach();
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let item = |label: &'static str, icon: IconName, target: Screen, cx: &mut Context<Self>| {
-            button(label)
-                .tooltip(crate::preferences::hint(
+    fn sidebar(&self, collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let queued = self.snapshot().map_or(0, |snapshot| {
+            snapshot
+                .jobs
+                .iter()
+                .filter(|job| matches!(job.state.as_str(), "queued" | "running"))
+                .count()
+        });
+        let pending = self.snapshot().map_or(0, |snapshot| snapshot.pending);
+        let item =
+            move |label: &'static str, icon: IconName, target: Screen, cx: &mut Context<Self>| {
+                let count = match target {
+                    Screen::Transfers => queued,
+                    Screen::Check => pending,
+                    _ => 0,
+                };
+                let noun = match target {
+                    Screen::Transfers => "active transfers",
+                    _ => "unfinished copies",
+                };
+                let tooltip = if count > 0 {
+                    format!("{label} · {count} {noun}")
+                } else {
+                    label.to_owned()
+                };
+                let badge = (count > 0 && !collapsed).then(|| {
+                    div()
+                        .flex_1()
+                        .h_flex()
+                        .justify_end()
+                        .child(crate::ui::count_badge(count, cx))
+                });
+                let item_button = button(label)
+                    .tooltip(crate::preferences::hint(
+                        cx,
+                        &tooltip,
+                        match target {
+                            Screen::Files => "Ctrl+1",
+                            Screen::Accounts => "Ctrl+2",
+                            Screen::Check => "Ctrl+3",
+                            Screen::Transfers => "Ctrl+4",
+                            Screen::Settings => "Ctrl+5",
+                            Screen::Storage => "",
+                        },
+                        true,
+                    ))
+                    .ghost()
+                    .icon(icon)
+                    .selected(self.screen == target)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.screen != target {
+                            this.screen_generation += 1;
+                        }
+                        this.screen = target;
+                        window.focus(&this.root_focus);
+                        if target == Screen::Transfers {
+                            this.refresh_transfers(cx);
+                        }
+                        // The first visit to Accounts asks each account for its space.
+                        if target == Screen::Accounts && matches!(this.health, Health::NotChecked) {
+                            this.check_health(cx);
+                        }
+                        cx.notify();
+                    }));
+                if collapsed {
+                    item_button.w_8()
+                } else {
+                    item_button
+                        .w_full()
+                        .justify_start()
+                        .label(label)
+                        .children(badge)
+                }
+            };
+        let commands = button("open-command-palette")
+            .ghost()
+            .icon(IconName::SquareTerminal)
+            .tooltip(crate::preferences::hint(
+                cx,
+                "Find an action",
+                "Ctrl+K",
+                false,
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.open_commands(false, window, cx)));
+        let help = button("open-help")
+            .ghost()
+            .icon(IconName::BookOpen)
+            .tooltip(crate::preferences::hint(
+                cx,
+                "Help and guided tour",
+                "F1",
+                false,
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.open_commands(true, window, cx)));
+        if collapsed {
+            let compact_badge =
+                |count: usize, btn: gpui_component::button::Button, cx: &Context<Self>| {
+                    div()
+                        .relative()
+                        .w_8()
+                        .child(btn)
+                        .children((count > 0).then(|| {
+                            div()
+                                .absolute()
+                                .top(px(-2.0))
+                                .right(px(-2.0))
+                                .min_w(px(16.0))
+                                .h(px(16.0))
+                                .px_1()
+                                .rounded_full()
+                                .bg(cx.theme().primary)
+                                .text_color(cx.theme().primary_foreground)
+                                .text_xs()
+                                .font_semibold()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(if count > 99 {
+                                    "99+".to_owned()
+                                } else {
+                                    count.to_string()
+                                })
+                        }))
+                };
+            return div()
+                .v_flex()
+                .w(px(56.0))
+                .h_full()
+                .flex_none()
+                .items_center()
+                .gap_1()
+                .py_3()
+                .bg(cx.theme().sidebar)
+                .border_r_1()
+                .border_color(cx.theme().border)
+                .child(commands.w_8())
+                .child(help.w_8())
+                .child(div().h_3())
+                .child(item("Files", IconName::Folder, Screen::Files, cx))
+                .child(item("Accounts", IconName::CircleUser, Screen::Accounts, cx))
+                .child(compact_badge(
+                    pending,
+                    item("Check", IconName::CircleCheck, Screen::Check, cx),
                     cx,
-                    label,
-                    match target {
-                        Screen::Files => "Ctrl+1",
-                        Screen::Accounts => "Ctrl+2",
-                        Screen::Check => "Ctrl+3",
-                        Screen::Transfers => "Ctrl+4",
-                        Screen::Settings => "Ctrl+5",
-                        Screen::Storage => "",
-                    },
-                    true,
                 ))
-                .ghost()
-                .w_full()
-                .justify_start()
-                .icon(icon)
-                .label(label)
-                .selected(self.screen == target)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.screen != target {
-                        this.screen_generation += 1;
-                    }
-                    this.screen = target;
-                    if target == Screen::Transfers {
-                        this.refresh_transfers(cx);
-                    }
-                    // The first visit to Accounts asks each account for its space.
-                    if target == Screen::Accounts && matches!(this.health, Health::NotChecked) {
-                        this.check_health(cx);
-                    }
-                    cx.notify();
-                }))
-        };
+                .child(compact_badge(
+                    queued,
+                    item("Transfers", IconName::Inbox, Screen::Transfers, cx),
+                    cx,
+                ))
+                .child(item("Settings", IconName::Settings, Screen::Settings, cx))
+                .child(div().flex_1().min_h(px(0.0)))
+                .child(self.storage_indicator(true, cx))
+                .into_any_element();
+        }
+        let header = div()
+            .h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .child(div().text_lg().font_semibold().child("Bufonidae"))
+            .child(div().h_flex().child(commands).child(help));
         Sidebar::left()
-            .header(SidebarHeader::new().child(div().text_lg().font_semibold().child("Bufonidae")))
+            .header(SidebarHeader::new().child(header))
             .child(SidebarGroup::new("Library").child(Navigation::new(vec![
                 item("Files", IconName::Folder, Screen::Files, cx),
                 item("Accounts", IconName::CircleUser, Screen::Accounts, cx),
@@ -950,116 +1189,124 @@ impl BufonidaeApp {
                 Screen::Settings,
                 cx,
             )])))
-            .footer(SidebarFooter::new().child(self.storage_indicator(cx)))
+            .footer(SidebarFooter::new().child(self.storage_indicator(false, cx)))
+            .into_any_element()
     }
 
-    fn storage_indicator(&self, cx: &mut Context<Self>) -> AnyElement {
-        let snapshot = self.snapshot();
+    fn storage_percent(&self) -> f32 {
+        crate::storage::Storage::collect(
+            self.snapshot()
+                .into_iter()
+                .flat_map(|s| s.accounts.iter())
+                .map(|a| self.health.of(&a.id)),
+        )
+        .percent()
+    }
+
+    fn storage_indicator(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
         let storage = crate::storage::Storage::collect(
-            snapshot
+            self.snapshot()
                 .into_iter()
                 .flat_map(|s| s.accounts.iter())
                 .map(|a| self.health.of(&a.id)),
         );
         let checking = matches!(self.health, Health::Checking);
-        let mut panel = div().v_flex().w_full().min_w(px(0.0)).gap_2().child(
+        let open = |cx: &mut Context<Self>| {
+            button("open-storage-distribution")
+                .ghost()
+                .selected(self.screen == Screen::Storage)
+                .tooltip("Open storage distribution and preview Sync")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.execute_command(Command::Storage, window, cx)
+                }))
+        };
+        if collapsed {
+            return open(cx).icon(IconName::ChartPie).w_8().into_any_element();
+        }
+        if self.screen == Screen::Files
+            && self
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.accounts.is_empty() && snapshot.files.is_empty())
+        {
+            return open(cx)
+                .w_full()
+                .justify_start()
+                .label("Storage")
+                .into_any_element();
+        }
+        let line = if checking {
+            "Checking…".to_owned()
+        } else if storage.accounts == 0 {
+            "Connect an account to see capacity.".to_owned()
+        } else if matches!(self.health, Health::Failed(_)) {
+            "Storage check failed. Try again.".to_owned()
+        } else if storage.reported == 0 {
+            "Capacity unavailable.".to_owned()
+        } else if storage.reported < storage.accounts {
+            format!(
+                "{} / {} used · {}/{} accounts",
+                format::bytes(storage.used),
+                format::bytes(storage.total),
+                storage.reported,
+                storage.accounts
+            )
+        } else {
+            format!(
+                "{} / {} used",
+                format::bytes(storage.used),
+                format::bytes(storage.total)
+            )
+        };
+        let mut panel = div().v_flex().w(px(136.0)).gap_1().child(
             div()
                 .h_flex()
                 .w_full()
                 .justify_between()
-                .gap_2()
-                .child(div().font_semibold().child("Account storage"))
+                .child(div().font_semibold().child("Storage"))
                 .children(
                     (storage.reported > 0)
                         .then(|| div().text_sm().child(format!("{:.0}%", storage.percent()))),
                 ),
         );
         if storage.reported > 0 {
-            panel = panel
-                .child(
-                    gpui_component::progress::Progress::new()
-                        .w_full()
-                        .value(storage.percent()),
-                )
-                .child(div().text_sm().child(format!(
-                    "{} / {} used",
-                    format::bytes(storage.used),
-                    format::bytes(storage.total)
-                )))
-                .child(
-                    div()
-                        .text_sm()
-                        .child(format!("{} available", format::bytes(storage.free))),
-                );
+            panel = panel.child(div().w_full().child(motion::progress(
+                self.storage_from,
+                self.storage_to,
+                self.storage_revision,
+                cx,
+            )));
         }
-        let coverage = if checking {
-            "Checking account storage…".to_owned()
-        } else if storage.accounts == 0 {
-            "Connect an account to see capacity.".to_owned()
-        } else if matches!(self.health, Health::Failed(_)) {
-            "Storage check failed. Try again.".to_owned()
-        } else if storage.reported == 0 {
-            "Storage figures unavailable.".to_owned()
-        } else if storage.reported < storage.accounts {
-            format!(
-                "Partial · {}/{} accounts reported",
-                storage.reported, storage.accounts
-            )
-        } else {
-            format!("Last check · {} accounts", storage.accounts)
-        };
-        panel = panel.child(if checking {
-            motion::activity("Checking storage", cx)
-        } else {
+        panel = panel.child(
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(coverage)
-                .into_any_element()
-        });
-        if let Some(snapshot) = snapshot {
-            let active = snapshot
-                .jobs
-                .iter()
-                .filter(|job| matches!(job.state.as_str(), "queued" | "running"))
-                .count();
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} indexed · {} active jobs",
-                        format::bytes(snapshot.total_bytes()),
-                        active
-                    )),
-            );
-        }
+                .w_full()
+                .child(line),
+        );
         div()
-            .v_flex()
+            .h_flex()
             .w_full()
             .min_w(px(0.0))
+            .items_center()
             .gap_1()
             .child(
-                button("open-storage-distribution")
-                    .ghost()
-                    .selected(self.screen == Screen::Storage)
-                    .w_full()
-                    .h_auto()
-                    .p_2()
-                    .justify_start()
-                    .text_left()
-                    .tooltip("Open storage distribution and preview Sync")
-                    .child(panel)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.execute_command(Command::Storage, window, cx)
-                    })),
+                div().flex_1().min_w(px(0.0)).child(
+                    open(cx)
+                        .w_full()
+                        .h_auto()
+                        .p_2()
+                        .justify_start()
+                        .text_left()
+                        .child(panel),
+                ),
             )
             .child(
                 button("refresh-sidebar-storage")
+                    .flex_none()
                     .ghost()
-                    .w_full()
-                    .label(if checking {
-                        "Checking…"
+                    .icon(IconName::Redo)
+                    .tooltip(if checking {
+                        "Checking storage…"
                     } else {
                         "Refresh storage"
                     })
@@ -1069,50 +1316,13 @@ impl BufonidaeApp {
             .into_any_element()
     }
 
-    fn utility_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .h_flex()
-            .w_full()
-            .flex_none()
-            .justify_end()
-            .gap_2()
-            .px_6()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                button("open-command-palette")
-                    .ghost()
-                    .label("Commands")
-                    .tooltip(crate::preferences::hint(
-                        cx,
-                        "Find an action",
-                        "Ctrl+K",
-                        false,
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_commands(false, window, cx)),
-                    ),
-            )
-            .child(
-                button("open-help")
-                    .ghost()
-                    .label("Help")
-                    .tooltip(crate::preferences::hint(
-                        cx,
-                        "Help and guided tour",
-                        "F1",
-                        false,
-                    ))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_commands(true, window, cx)),
-                    ),
-            )
-    }
-
     fn body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.data {
-            Data::Loading => centered(cx, None, "Loading…", None).into_any_element(),
+            Data::Loading => motion::delayed(
+                centered(cx, None, "Loading…", None).into_any_element(),
+                "library-loading",
+                cx,
+            ),
             Data::Failed(message) => centered(
                 cx,
                 Some(IconName::TriangleAlert),
@@ -1191,7 +1401,6 @@ impl Render for BufonidaeApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(cx.theme().overlay)
                 .occlude()
                 .track_focus(&self.modal_focus)
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1233,13 +1442,22 @@ impl Render for BufonidaeApp {
                         None => {}
                     }
                 }))
-                .child(motion::fade(
-                    div()
-                        .id("modal-scroll")
-                        .max_h(window.viewport_size().height - px(32.0))
-                        .overflow_y_scroll()
-                        .max_w(window.viewport_size().width - px(32.0))
-                        .child(form),
+                .child(motion::scrim(
+                    cx.theme().overlay,
+                    (
+                        if self.modal_closing {
+                            "scrim-exit"
+                        } else {
+                            "scrim-enter"
+                        },
+                        self.modal_generation,
+                    ),
+                    self.modal_closing,
+                    self.modal_exit_opacity,
+                    cx,
+                ))
+                .child(motion::dialog(
+                    form,
                     (
                         if self.modal_closing {
                             "modal-exit"
@@ -1260,8 +1478,10 @@ impl Render for BufonidaeApp {
 
         // Dropping files anywhere on the window opens the store dialog; while
         // dragging, the window is tinted to say it is a drop target.
-        let drop_tint = cx.theme().accent;
+        let drop_accent = cx.theme().primary;
+        let drop_surface = cx.theme().popover;
         base.relative()
+            .track_focus(&self.root_focus)
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 use bufonidae_core::config::ShortcutMode;
                 let options = crate::preferences::current(cx);
@@ -1320,11 +1540,15 @@ impl Render for BufonidaeApp {
                     .id("window-content")
                     .size_full()
                     .h_flex()
-                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_tint))
+                    .relative()
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                         this.open_store(paths.paths().to_vec(), window, cx);
                     }))
-                    .child(self.sidebar(cx))
+                    .child(self.sidebar(
+                        window.viewport_size().width < px(800.0)
+                            || window.viewport_size().height < px(560.0),
+                        cx,
+                    ))
                     .child(
                         div()
                             .v_flex()
@@ -1332,7 +1556,6 @@ impl Render for BufonidaeApp {
                             .h_full()
                             .min_w(px(0.0))
                             .overflow_hidden()
-                            .child(self.utility_bar(cx))
                             .child(
                                 div()
                                     .w_full()
@@ -1344,6 +1567,34 @@ impl Render for BufonidaeApp {
                                         self.screen_generation,
                                         cx,
                                     )),
+                            ),
+                    )
+                    .child(
+                        // Invisible until files are dragged over the window;
+                        // it never takes clicks or drops, only shows the target.
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .m_2()
+                            .rounded(px(12.0))
+                            .border_2()
+                            .border_color(drop_accent)
+                            .bg(drop_accent.opacity(0.08))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .opacity(0.0)
+                            .drag_over::<ExternalPaths>(|style, _, _, _| style.opacity(1.0))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_full()
+                                    .bg(drop_surface)
+                                    .border_1()
+                                    .border_color(drop_accent)
+                                    .font_semibold()
+                                    .child("Drop to store"),
                             ),
                     ),
             )

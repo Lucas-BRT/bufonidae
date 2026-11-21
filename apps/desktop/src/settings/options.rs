@@ -11,13 +11,10 @@ fn section(
     div()
         .v_flex()
         .w_full()
-        .gap_3()
-        .mb_4()
-        .p_5()
-        .rounded(px(12.0))
-        .border_1()
+        .gap_2()
+        .py_3()
+        .border_b_1()
         .border_color(cx.theme().border)
-        .bg(cx.theme().popover)
         .child(div().font_semibold().child(title.to_owned()))
         .child(
             div()
@@ -111,12 +108,15 @@ impl SettingsView {
             return;
         }
         self.notification_testing = true;
-        self.notification_feedback = Some("Sending test notification…".into());
+        self.notification_feedback = Some((
+            crate::ui::Tone::Neutral,
+            "Sending test notification…".into(),
+        ));
         let job = self
             .backend
             .test_notification(self.desktop_draft.clone(), failed);
         cx.spawn(async move|this,cx| {
-            let message=match job.await {Ok(Ok(()))=>"Notification accepted by the desktop service. Check your desktop's notification settings if it is hidden.".into(),Ok(Err(error))=>error,Err(error)=>error.to_string()};
+            let message=match job.await {Ok(Ok(()))=>(crate::ui::Tone::Success,"Notification accepted by the desktop service. Check your desktop's notification settings if it is hidden.".to_owned()),Ok(Err(error))=>(crate::ui::Tone::Danger,error),Err(error)=>(crate::ui::Tone::Danger,error.to_string())};
             this.update(cx,|this,cx|{this.notification_testing=false;this.notification_feedback=Some(message);cx.notify();}).ok();
         }).detach();
         cx.notify();
@@ -160,7 +160,7 @@ impl SettingsView {
         }
         let appearance = section(
             "Density and text",
-            "Choose file-row density separately from the base text size. Changes apply after Save, including toolkit text and controls.",
+            "Desktop preferences apply when you choose Save.",
             vec![
                 density.into_any_element(),
                 div()
@@ -214,7 +214,7 @@ impl SettingsView {
         ];
         let browsing = section(
             "Search, sorting and selection",
-            "Defaults for Files. Search matches names in the open folder. Filtering does not discard selected paths. Download selected preserves virtual paths and avoids downloading descendants twice when their parent is selected.",
+            "Defaults for Files. Search stays in the open folder and filters preserve selection.",
             browsing_controls,
             cx,
         );
@@ -238,20 +238,89 @@ impl SettingsView {
                 .child(self.option(id, label, p.sound == value, cx, move |p| p.sound = value));
         }
         let notification_controls = vec![
-            self.toggle_option("notify-success", "Notify when a batch completes", p.notify_success, cx, |p,v| p.notify_success=v),
-            self.toggle_option("notify-failure", "Notify on failures or partial completion", p.notify_failure, cx, |p,v| p.notify_failure=v),
-            self.toggle_option("notify-cancel", "Notify when a transfer is cancelled", p.notify_cancel, cx, |p,v| p.notify_cancel=v),
-            self.toggle_option("notify-names", "Include paths in desktop notifications", p.notification_names, cx, |p,v| p.notification_names=v),
-            div().text_sm().child(format!("Requested duration: {} seconds (the desktop may override it)",p.notification_seconds)).into_any_element(),duration.into_any_element(),
-            div().text_sm().child("Sound policy for enabled notification events").into_any_element(), sounds.into_any_element(),
-            button("test-notification").label("Test completion notification").disabled_feedback(self.notification_testing).on_click(cx.listener(|this,_,_,cx|this.test_notifications(false,cx))).into_any_element(),
-            button("test-failure-notification").label("Test failure notification").disabled_feedback(self.notification_testing).on_click(cx.listener(|this,_,_,cx|this.test_notifications(true,cx))).into_any_element(),
-            div().text_sm().child(self.notification_feedback.clone().unwrap_or_else(||"The test uses unsaved values; saving is not required.".into())).into_any_element(),
-            div().text_sm().child("Delivery uses the Linux notification service through gdbus. Sounds use paplay and the freedesktop sound theme. Private paths are omitted by default. Configure the native tray separately below; active jobs also remain visible in the sidebar and Transfers.").into_any_element(),
+            self.toggle_option(
+                "notify-success",
+                "Notify when a batch completes",
+                p.notify_success,
+                cx,
+                |p, v| p.notify_success = v,
+            ),
+            self.toggle_option(
+                "notify-failure",
+                "Notify on failures or partial completion",
+                p.notify_failure,
+                cx,
+                |p, v| p.notify_failure = v,
+            ),
+            self.toggle_option(
+                "notify-cancel",
+                "Notify when a transfer is cancelled",
+                p.notify_cancel,
+                cx,
+                |p, v| p.notify_cancel = v,
+            ),
+            self.toggle_option(
+                "notify-names",
+                "Include paths in desktop notifications",
+                p.notification_names,
+                cx,
+                |p, v| p.notification_names = v,
+            ),
+            div()
+                .text_sm()
+                .child("Display duration (your desktop may override it)")
+                .into_any_element(),
+            duration.into_any_element(),
+            div()
+                .text_sm()
+                .child("Sound policy for enabled notification events")
+                .into_any_element(),
+            sounds.into_any_element(),
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_2()
+                .items_center()
+                .child(
+                    button("test-notification")
+                        .label("Test completion notification")
+                        .disabled_feedback(self.notification_testing)
+                        .on_click(cx.listener(|this, _, _, cx| this.test_notifications(false, cx))),
+                )
+                .child(
+                    button("test-failure-notification")
+                        .label("Test failure notification")
+                        .disabled_feedback(self.notification_testing)
+                        .on_click(cx.listener(|this, _, _, cx| this.test_notifications(true, cx))),
+                )
+                .children(self.notification_feedback.as_ref().map(|(tone, _)| {
+                    crate::ui::chip(
+                        *tone,
+                        if self.notification_testing {
+                            Some(IconName::Loader)
+                        } else {
+                            None
+                        },
+                        match (*tone, self.notification_testing) {
+                            (_, true) => "Sending",
+                            (crate::ui::Tone::Success, _) => "Sent",
+                            _ => "Failed",
+                        },
+                        cx,
+                    )
+                }))
+                .into_any_element(),
+            div()
+                .text_sm()
+                .child(self.notification_feedback.as_ref().map_or_else(
+                    || "The test uses unsaved values; saving is not required.".to_owned(),
+                    |(_, message)| message.clone(),
+                ))
+                .into_any_element(),
         ];
         let notifications = section(
             "Notifications and sounds",
-            "One notification per completed, failed or cancelled batch, rather than one per file. The application must remain running. Your desktop controls do-not-disturb and final display duration.",
+            "One notification per batch while the app is running. Desktop do-not-disturb settings apply.",
             notification_controls,
             cx,
         );
@@ -266,22 +335,38 @@ impl SettingsView {
             }));
         }
         let shortcut_controls=vec![keys.into_any_element(),
-            div().text_sm().child("Navigation: Ctrl+1…5 changes screens, Alt+Up opens the parent folder, F5 refreshes. Full mode adds Ctrl+F search, Ctrl+O Add, Ctrl+K commands and F1 help. Dialog input keeps priority; shortcuts do not launch another action over a modal.").into_any_element(),
+            div().text_sm().child("Navigation: Ctrl+1…5, Alt+Up and F5. Full mode adds search, Add, Commands and Help shortcuts.").into_any_element(),
             self.toggle_option("context-menu", "Enable file context menus",p.context_menus,cx,|p,v|p.context_menus=v),
             self.toggle_option("shortcut-hints", "Show shortcut hints in tooltips and help",p.shortcut_hints,cx,|p,v|p.shortcut_hints=v)];
         let shortcuts = section(
             "Keyboard and context menus",
-            "Choose a shortcut preset. Commands and Help remain available as buttons when shortcuts are off; context menus supplement visible actions.",
+            "Commands and Help are available from the sidebar.",
             shortcut_controls,
             cx,
         );
-        let help_controls=vec![
-            self.toggle_option("inline-help","Show contextual explanations in Files",p.inline_help,cx,|p,v|p.inline_help=v),
-            self.toggle_option("first-run-help","Show first-account guidance",p.first_run_help,cx,|p,v|p.first_run_help=v),
-            div().text_sm().child("Help covers accounts, storing, downloads, recovery and privacy. Disabling guidance does not hide errors, required confirmations, verification costs or safety notices.").into_any_element()];
+        let help_controls = vec![
+            self.toggle_option(
+                "inline-help",
+                "Show contextual explanations in Files",
+                p.inline_help,
+                cx,
+                |p, v| p.inline_help = v,
+            ),
+            self.toggle_option(
+                "first-run-help",
+                "Show first-account guidance",
+                p.first_run_help,
+                cx,
+                |p, v| p.first_run_help = v,
+            ),
+            div()
+                .text_sm()
+                .child("Required warnings and confirmations stay visible.")
+                .into_any_element(),
+        ];
         let help = section(
             "Guidance and help",
-            "Control when explanatory guidance appears. Help is always accessible from the sidebar.",
+            "Choose where contextual guidance appears.",
             help_controls,
             cx,
         );
@@ -291,18 +376,14 @@ impl SettingsView {
             .as_ref()
             .map(|tray| tray.status())
             .unwrap_or_else(|| "Unavailable".into());
-        let tray = section("System tray", "Requires desktop StatusNotifier support (GNOME may need an AppIndicator extension). Save applies these preferences. Closing the window exits the app; transfers require it to remain open.", vec![
+        let tray = section("System tray", "Requires StatusNotifier support. GNOME may need an AppIndicator extension. Closing the window exits the app and stops transfers.", vec![
             self.toggle_option("tray-enabled", "Show a system tray icon", p.tray_enabled, cx, |p,v| p.tray_enabled=v),
             self.toggle_option("tray-idle", "Keep the icon visible when no transfers are active", p.tray_when_idle, cx, |p,v| p.tray_when_idle=v),
-            self.toggle_option("tray-badge", "Overlay the queued and running transfer count (up to 99)", p.tray_badge, cx, |p,v| p.tray_badge=v),
+            self.toggle_option("tray-badge", "Show a transfer count badge", p.tray_badge, cx, |p,v| p.tray_badge=v),
             self.toggle_option("tray-primary", "Primary click opens Transfers; otherwise show the current screen", p.tray_open_transfers, cx, |p,v| p.tray_open_transfers=v),
-            div().text_sm().child(format!("Saved configuration status: {tray_status}. The tray menu opens the app, Transfers or Settings. The tooltip shows the exact count; badge rendering depends on desktop support.")).into_any_element(),
+            div().text_sm().child(format!("Tray status: {tray_status}. The badge shows up to 99 queued and running transfers. Hover over the icon for the exact count.")).into_any_element(),
             button("retry-tray").label("Retry tray connection").disabled_feedback(self.saving() || !self.config.as_ref().is_some_and(|c| c.desktop().tray_enabled)).on_click(cx.listener(|this,_,_,cx| { if let Some(tray) = &this.backend.tray { tray.retry(); } cx.notify(); })).into_any_element(),
         ],cx);
-        let changed = self
-            .config
-            .as_ref()
-            .is_some_and(|config| config.desktop() != &p);
         div()
             .w_full()
             .max_w(px(560.0))
@@ -312,31 +393,6 @@ impl SettingsView {
             .child(tray)
             .child(shortcuts)
             .child(help)
-            .child(
-                div()
-                    .h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        button("save-desktop-options")
-                            .primary()
-                            .label("Save desktop preferences")
-                            .disabled_feedback(self.saving() || !changed)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_desktop(cx))),
-                    )
-                    .child(
-                        button("discard-desktop-options")
-                            .label("Discard unsaved changes")
-                            .disabled_feedback(self.saving() || !changed)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(config) = &this.config {
-                                    this.desktop_draft = config.desktop().clone();
-                                }
-                                this.desktop_status = Status::Idle;
-                                cx.notify();
-                            })),
-                    ),
-            )
             .children(status_line(
                 &self.desktop_status,
                 cx.theme().muted_foreground,
@@ -346,5 +402,66 @@ impl SettingsView {
             ))
             .pb_4()
             .into_any_element()
+    }
+
+    /// Whether the desktop preferences differ from what is saved.
+    pub(super) fn desktop_changed(&self) -> bool {
+        self.config
+            .as_ref()
+            .is_some_and(|config| config.desktop() != &self.desktop_draft)
+    }
+
+    /// Stays below the scrolling page while there is something to save, so
+    /// Save and Discard never scroll out of reach.
+    pub(super) fn save_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let changed = self.desktop_changed();
+        let saving = self.saving();
+        changed.then(|| {
+            div()
+                .h_flex()
+                .flex_none()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .px_6()
+                .py_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .child(
+                    div()
+                        .size(px(8.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(cx.theme().primary),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .font_semibold()
+                        .child("Unsaved desktop preferences"),
+                )
+                .child(
+                    button("discard-desktop-options")
+                        .label("Discard")
+                        .disabled_feedback(saving)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(config) = &this.config {
+                                this.desktop_draft = config.desktop().clone();
+                            }
+                            this.desktop_status = Status::Idle;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    button("save-desktop-options")
+                        .primary()
+                        .label("Save desktop preferences")
+                        .disabled_feedback(saving)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_desktop(cx))),
+                )
+                .into_any_element()
+        })
     }
 }

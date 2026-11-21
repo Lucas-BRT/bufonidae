@@ -55,15 +55,11 @@ impl gpui::RenderOnce for Navigation {
     fn render(self, _: &mut gpui::Window, _: &mut gpui::App) -> impl gpui::IntoElement {
         use gpui::ParentElement as _;
         use gpui_component::StyledExt as _;
-        gpui::div()
-            .v_flex()
-            .gap_2()
-            .children(self.buttons.into_iter().map(|button| {
-                if self.collapsed {
-                    button.label("").w_8()
-                } else {
-                    button
-                }
-            }))
+        let list = gpui::div().v_flex().gap_2();
+        if self.collapsed {
+            list.items_center().children(self.buttons)
+        } else {
+            list.children(self.buttons)
+        }
     }
 }

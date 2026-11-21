@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use gpui::{
     Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    Styled as _, Window, div, px, uniform_list,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, StyledExt as _, button::ButtonVariants as _,
@@ -120,12 +120,7 @@ impl BrowseForm {
 impl Render for BrowseForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, danger, border, surface) = (
-            theme.muted_foreground,
-            theme.danger,
-            theme.border,
-            theme.popover,
-        );
+        let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
         let visible = self.visible();
         let count = visible.len();
         let parent = self.dir.parent().map(std::path::Path::to_path_buf);
@@ -171,15 +166,14 @@ impl Render for BrowseForm {
                                 )
                                 .into_any_element();
                         }
+                        let toggle_path = path.clone();
+                        let row_path = path.clone();
                         let checkbox =
                             checkbox(gpui::SharedString::from(format!("pick-{:?}", entry.path)))
-                                .label(entry.name.clone())
                                 .checked(chosen)
-                                .w_full()
-                                .min_w(px(0.0))
-                                .on_click(cx.listener({
-                                    let path = path.clone();
-                                    move |this, _: &bool, _, cx| this.toggle(path.clone(), cx)
+                                .on_click(cx.listener(move |this, _: &bool, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle(toggle_path.clone(), cx);
                                 }));
                         let open = entry.is_dir.then(|| {
                             button(gpui::SharedString::from(format!("open-{:?}", entry.path)))
@@ -188,26 +182,25 @@ impl Render for BrowseForm {
                                 .flex_none()
                                 .label("Open")
                                 .tooltip(format!("Open {}", entry.name))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)),
-                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open(path.clone(), cx);
+                                }))
                         });
-                        row.child(Icon::new(icon).flex_none().text_color(muted))
-                            // Checkbox renders an outer wrapper: flex growth must
-                            // belong to this direct child of the row instead.
+                        row.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle(row_path.clone(), cx);
+                            }))
+                            .child(checkbox)
+                            .child(Icon::new(icon).flex_none().text_color(muted))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .child(checkbox),
+                                    .truncate()
+                                    .child(entry.name.clone()),
                             )
                             .children(open)
-                            .children(entry.is_dir.then(|| {
-                                Icon::new(IconName::ChevronRight)
-                                    .flex_none()
-                                    .text_color(muted)
-                            }))
                             .into_any_element()
                     })
                     .collect::<Vec<_>>()
@@ -269,17 +262,7 @@ impl Render for BrowseForm {
             list.into_any_element()
         };
 
-        div()
-            .v_flex()
-            .w(px(560.0))
-            .max_w(window.viewport_size().width - px(32.0))
-            .gap_3()
-            .p_6()
-            .rounded(px(14.0))
-            .bg(surface)
-            .border_1()
-            .border_color(border)
-            .shadow_lg()
+        crate::ui::Dialog::new(560.0, window, cx)
             .child(
                 div()
                     .v_flex()
@@ -345,7 +328,7 @@ impl Render for BrowseForm {
                     .overflow_hidden()
                     .child(body),
             )
-            .child(
+            .footer(
                 div()
                     .h_flex()
                     .w_full()
