@@ -23,6 +23,7 @@ env:
 
 jobs:
   release:
+    timeout-minutes: 90
     runs-on: ubuntu-24.04
     permissions:
       contents: write # to create the draft release
@@ -66,6 +67,7 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' }}
           shared-key: bufonidae
 
       # The rclone shipped in the packages, and used by the integration tests. It
