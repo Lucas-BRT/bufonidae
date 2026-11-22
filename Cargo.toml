@@ -23,7 +23,7 @@ directories = "=6.0.0"
 keyring = "=4.2.0"
 rpassword = "=7.5.5"
 toml = "=1.2.1"
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 anyhow = "=1.0.104"
 # gpui is unstable between releases: pinned exactly.
 gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11", "font-kit"] }
